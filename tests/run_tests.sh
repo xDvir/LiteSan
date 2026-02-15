@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run_tests.sh — Comprehensive test suite for canary_sanitizer v2
+# run_tests.sh — Comprehensive test suite for canary_sanitizer
 #
 # Builds all tests, runs them with the sanitizer, checks results.
 # Tests are either CRASH (expected abort, exit 134) or CLEAN (expected exit 0).
@@ -120,7 +120,7 @@ run_test() {
 
 echo ""
 echo -e "${CYN}╔══════════════════════════════════════════════════════════════╗${RST}"
-echo -e "${CYN}║          Canary Sanitizer v2 — Test Suite                   ║${RST}"
+echo -e "${CYN}║          Canary Sanitizer — Test Suite                      ║${RST}"
 echo -e "${CYN}╚══════════════════════════════════════════════════════════════╝${RST}"
 echo ""
 
@@ -156,14 +156,14 @@ run_test "$SCRIPT_DIR/test_uaf_write_delayed.c"           CRASH "" "USE-AFTER-FR
 run_test "$SCRIPT_DIR/test_uaf_read_poison.c"             CLEAN "" "read poison"
 echo ""
 
-# ─── v2: Multi-Spot UAF Detection (NEW) ──────────────────────────────
-echo -e "${CYN}── v2: Multi-Spot UAF Detection ──${RST}"
+# ─── v2: Multi-Spot UAF Detection ──────────────────────────────────
+echo -e "${CYN}── Multi-Spot UAF Detection ──${RST}"
 run_test "$SCRIPT_DIR/test_uaf_write_middle.c"            CRASH "" "USE-AFTER-FREE"
 run_test "$SCRIPT_DIR/test_uaf_write_end.c"               CRASH "" "USE-AFTER-FREE"
 echo ""
 
-# ─── v2: Aligned Allocator Interception (NEW) ────────────────────────
-echo -e "${CYN}── v2: Aligned Allocator Interception ──${RST}"
+# ─── v2: Aligned Allocator Interception ────────────────────────
+echo -e "${CYN}── Aligned Allocator Interception ──${RST}"
 run_test "$SCRIPT_DIR/test_memalign_basic.c"              CLEAN
 run_test "$SCRIPT_DIR/test_memalign_overflow.c"           CRASH "" "HEAP BUFFER OVERFLOW"
 run_test "$SCRIPT_DIR/test_posix_memalign_basic.c"        CLEAN
@@ -180,7 +180,7 @@ run_test "$SCRIPT_DIR/test_calloc_zeroed.c"               CLEAN "" "calloc memor
 echo ""
 
 # ─── v2: calloc overflow protection ───────────────────────────────────
-echo -e "${CYN}── v2: Calloc Overflow Protection ──${RST}"
+echo -e "${CYN}── Calloc Overflow Protection ──${RST}"
 run_test "$SCRIPT_DIR/test_calloc_int_overflow.c"         CLEAN "" "calloc returned NULL"
 echo ""
 
@@ -196,6 +196,28 @@ run_test "$SCRIPT_DIR/test_free_null.c"                   CLEAN
 run_test "$SCRIPT_DIR/test_quarantine_eviction_clean.c"   CLEAN
 run_test "$SCRIPT_DIR/test_quarantine_stress.c"           CLEAN
 run_test "$SCRIPT_DIR/test_mixed_alloc_types.c"           CLEAN
+echo ""
+
+# ─── v3: Heap Underflow Detection ────────────────────────────────────
+echo -e "${CYN}── Heap Underflow Detection ──${RST}"
+run_test "$SCRIPT_DIR/test_underflow_basic.c"             CRASH "" "HEAP UNDERFLOW"
+run_test "$SCRIPT_DIR/test_underflow_memcpy.c"            CRASH "" "HEAP UNDERFLOW"
+echo ""
+
+# ─── v3: Guard Page Detection ────────────────────────────────────────
+echo -e "${CYN}── Guard Page Detection ──${RST}"
+run_test "$SCRIPT_DIR/test_guard_page_basic.c"            CLEAN
+run_test "$SCRIPT_DIR/test_guard_page_overflow.c"         CRASH
+echo ""
+
+# ─── v3: Sampled Full-Buffer Check ───────────────────────────────────
+echo -e "${CYN}── Sampled Full-Buffer Check ──${RST}"
+run_test "$SCRIPT_DIR/test_uaf_full_scan.c"               CRASH "" "USE-AFTER-FREE"
+echo ""
+
+# ─── v3: Free-Site Diagnostics ───────────────────────────────────────
+echo -e "${CYN}── Free-Site Diagnostics ──${RST}"
+run_test "$SCRIPT_DIR/test_free_site_reported.c"          CRASH "" "free-site"
 echo ""
 
 # ─── Summary ─────────────────────────────────────────────────────────
