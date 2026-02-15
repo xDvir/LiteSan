@@ -79,17 +79,29 @@ never actually started fuzzing.
 - **Incremental registry scan** — scans 1/64th (1024 slots) per trigger instead
   of all 65,536. Same coverage over time, 64x less work per trigger.
 - **Inline memset** for allocations <= 64 bytes (the common case).
-- **Multi-spot + sampled full-buffer UAF check** — 3 spot-checks on every
-  eviction, plus a full byte scan every 64th eviction.
+- **Combined XOR quarantine spot-check** — 3 spots (first/mid/last 8 bytes)
+  combined into a single branch on the happy path, plus full byte scan every
+  64th eviction.
+- **Prefetch quarantine eviction target** — prefetches the block to be evicted
+  before poisoning, hiding memory latency behind memset work.
 - **Heap underflow detection** — 8-byte red zone before the header.
 - **Guard pages for huge allocs** (>= 64KB) — `mmap` + `PROT_NONE` pages
-  before and after. Hardware-enforced overflow/underflow detection.
+  before and after, **right-aligned** so tail canary ends within 7 bytes of
+  the guard page. Any overflow past the tail hits the guard page instantly.
+- **Alloc-site tracking** — stores `__builtin_return_address(0)` in the header
+  on every malloc. Error reports show both where the buffer was allocated and
+  where it was freed.
 - **Free-site diagnostics** — stores caller address on `free()`, prints it
   when UAF or double-free is detected.
 - **Aligned allocator interception** — `memalign`, `posix_memalign`,
   `aligned_alloc`, `valloc`, `pvalloc` all instrumented.
+- **`malloc_usable_size` / `reallocarray` interception** — returns correct
+  user size; `reallocarray` with overflow protection.
+- **Integer overflow protection** — `malloc(SIZE_MAX)` returns NULL instead of
+  silently wrapping to a tiny allocation.
 - **calloc integer overflow protection** — `calloc(nmemb, size)` where
   `nmemb * size` overflows returns NULL.
+- **`__attribute__((hot))`** on malloc/free for compiler optimization.
 - **-O3 build** with `__builtin_expect` on all error paths.
 
 ---
@@ -195,31 +207,32 @@ The bootstrap window is extremely short: just the 4 `dlsym()` calls during
 
 ## Memory Layout: How Every Allocation Looks
 
-When the program calls `malloc(N)`, we actually allocate `N + 32` bytes from
+When the program calls `malloc(N)`, we actually allocate `N + 40` bytes from
 libc and lay them out like this:
 
 ```
- What libc                                  What the program
- allocates                                  sees (returned ptr)
- ┌──────────┐                               │
- │          ▼                               ▼
- ┌──────────┬──────────┬──────────┬─────────────────────────┬──────────┐
- │underflow │  size    │  head    │    user data            │  tail    │
- │  canary  │  (8B)   │  canary  │    (N bytes)            │  canary  │
- │  (8B)   │          │  (8B)   │                         │  (8B)   │
- └──────────┴──────────┴──────────┴─────────────────────────┴──────────┘
- ◄──────── HDR_SIZE (24B) ────────►◄────── N bytes ─────────►◄─ 8B ───►
+ What libc                                              What the program
+ allocates                                              sees (returned ptr)
+ ┌──────────┐                                           │
+ │          ▼                                           ▼
+ ┌──────────┬──────────┬──────────┬──────────┬──────────────────────────┬──────────┐
+ │underflow │  alloc   │  size    │  head    │    user data             │  tail    │
+ │  canary  │  site    │  (8B)   │  canary  │    (N bytes)             │  canary  │
+ │  (8B)   │  (8B)   │          │  (8B)   │                          │  (8B)   │
+ └──────────┴──────────┴──────────┴──────────┴──────────────────────────┴──────────┘
+ ◄──────────── HDR_SIZE (32B) ──────────────►◄────── N bytes ──────────►◄─ 8B ───►
 
- Total libc allocation = 24 + N + 8 = N + 32 bytes
+ Total libc allocation = 32 + N + 8 = N + 40 bytes
 ```
 
-The `alloc_header_t` struct is the first 24 bytes:
+The `alloc_header_t` struct is the first 32 bytes:
 
 ```c
 typedef struct {
-    uint64_t underflow; // 8 bytes: UNDERFLOW_CANARY (red zone before header)
-    size_t   size;      // 8 bytes: the original requested size N
-    uint64_t canary;    // 8 bytes: HEAD_CANARY (live) or FREED_CANARY (freed)
+    uint64_t underflow;   // 8 bytes: UNDERFLOW_CANARY (red zone before header)
+    uint64_t alloc_site;  // 8 bytes: return address of malloc caller (diagnostics)
+    size_t   size;        // 8 bytes: the original requested size N
+    uint64_t canary;      // 8 bytes: HEAD_CANARY (live) or FREED_CANARY (freed)
 } alloc_header_t;
 ```
 
@@ -227,7 +240,11 @@ The **underflow canary** is an 8-byte red zone before the size/canary fields. If
 something writes backward past the start of a preceding allocation, it corrupts
 this value → detected on `free()` or `realloc()`.
 
-The **user pointer** (what `malloc` returns to the caller) points to byte 24 —
+The **alloc-site** stores `__builtin_return_address(0)` — the address of the code
+that called `malloc()`. On corruption, error messages show where the buffer was
+originally allocated, making it much easier to track down the root cause.
+
+The **user pointer** (what `malloc` returns to the caller) points to byte 32 —
 right after the header. The caller doesn't know about the header or tail canary.
 
 The **tail canary** is an 8-byte value written at `user_ptr + size`, immediately
@@ -236,10 +253,14 @@ this value, and we detect it on the next `free()` or `realloc()`.
 
 ### Huge allocations (>= 64KB): Guard page layout
 
-Allocations >= 64KB use `mmap` with hardware-enforced guard pages instead:
+Allocations >= 64KB use `mmap` with hardware-enforced guard pages instead.
+The data is **right-aligned** so the tail canary ends within 7 bytes of the
+back guard page — any overflow past the tail hits the guard page instantly:
 
 ```
- [PROT_NONE guard (4KB)] [header(24)] [user data(N)] [tail(8)] [PROT_NONE guard (4KB)]
+ [PROT_NONE guard (4KB)] [pad (0-7B)] [header(32)] [user data(N)] [tail(8)] [PROT_NONE guard (4KB)]
+                                                                      ▲               ▲
+                                                              max 7 bytes gap ────────┘
 ```
 
 Any overflow or underflow beyond the guard pages triggers an instant SIGSEGV
@@ -263,21 +284,23 @@ Memory Layout above).
 ```
 malloc(size):
     1. (libc pointers already resolved in constructor)
-    2. if size >= 64KB: return guard_page_alloc(size)
-    3. raw = real_malloc(24 + size + 8) — ask libc for extra space
-    4. hdr = (alloc_header_t *)raw
-    5. hdr->underflow = UNDERFLOW_CANARY — write underflow red zone
-    6. hdr->size   = size              — remember the requested size
-    7. hdr->canary = HEAD_CANARY       — write 0xDEADBEEFCAFEBABE
-    8. user = raw + 24                 — user pointer starts after header
-    9. fast_memset/memset(user, 0xAA)  — junk fill (inline for <= 64 bytes)
-   10. write_tail(user, size)          — write 0xFEEDFACE8BADF00D after user data
-   11. registry_add(hdr)               — track in allocation registry (Fibonacci hash)
-   12. maybe_incremental_scan()        — scan 1/64th of registry if counter triggers
-   13. return user                     — caller gets pointer to step 8
+    2. if size + 32 + 8 wraps: return NULL — integer overflow protection
+    3. if size >= 64KB: return guard_page_alloc(size)
+    4. raw = real_malloc(32 + size + 8) — ask libc for extra space
+    5. hdr = (alloc_header_t *)raw
+    6. hdr->underflow   = UNDERFLOW_CANARY — write underflow red zone
+    7. hdr->alloc_site  = return_address   — store caller address for diagnostics
+    8. hdr->size   = size              — remember the requested size
+    9. hdr->canary = HEAD_CANARY       — write 0xDEADBEEFCAFEBABE
+   10. user = raw + 32                 — user pointer starts after header
+   11. fast_memset/memset(user, 0xAA)  — junk fill (inline for <= 64 bytes)
+   12. write_tail(user, size)          — write 0xFEEDFACE8BADF00D after user data
+   13. registry_add(hdr)               — track in allocation registry (Fibonacci hash)
+   14. maybe_incremental_scan()        — scan 1/64th of registry if counter triggers
+   15. return user                     — caller gets pointer to step 10
 ```
 
-**Why junk fill (step 7)?** If we left the memory uninitialized (whatever libc
+**Why junk fill (step 11)?** If we left the memory uninitialized (whatever libc
 gives us), the program might read garbage and coincidentally get "correct" values.
 By filling with `0xAA` (10101010 in binary), any read of uninitialized memory
 produces a distinctive recognizable pattern. If you see `0xAAAAAAAA` in a crash
@@ -296,12 +319,13 @@ free(ptr):
          check_canaries + munmap
          return
     4. resolve_real()
-    5. hdr = ptr - 24                  — walk back to find our header
+    5. hdr = ptr - 32                  — walk back to find our header
     6. check_canaries(hdr, ptr)        — THE KEY CHECK (see below)
     7. hdr->underflow = return_address — store free-site for diagnostics
-    8. memset(ptr, 0xFE, size + 8)    — poison user data AND tail canary
-    9. hdr->canary = FREED_CANARY      — mark header as freed
-   10. tl_quarantine_push(hdr)         — push to thread-local quarantine ring
+    8. prefetch quarantine eviction target — hide memory latency
+    9. memset(ptr, 0xFE, size + 8)    — poison user data AND tail canary
+   10. hdr->canary = FREED_CANARY      — mark header as freed
+   11. tl_quarantine_push(hdr)         — push to thread-local quarantine ring
 ```
 
 **Step 6 — check_canaries()** does four checks in order:
@@ -340,16 +364,19 @@ would see the return address instead of UNDERFLOW_CANARY and falsely report
 reuses the underflow field (already validated) for diagnostics. If a UAF is
 later detected, the error message includes where the block was freed.
 
-**Step 8 — poison**: After the checks pass, we fill the entire user region
+**Step 8 — prefetch**: Before poisoning, we prefetch the quarantine slot that
+will be evicted next. This hides memory latency behind the memset work in step 9.
+
+**Step 9 — poison**: After the checks pass, we fill the entire user region
 (and the tail canary) with `0xFE`. This means:
 - Any subsequent READ of this memory returns `0xFEFEFEFE...` — distinctive
   pattern that screams "use-after-free" in debugger/crash dumps
 - Any subsequent WRITE changes the poison — detected by quarantine on eviction
 
-**Step 9 — mark freed**: We set `hdr->canary = FREED_CANARY` so that if
+**Step 10 — mark freed**: We set `hdr->canary = FREED_CANARY` so that if
 `free()` is called again on this pointer, step 6A catches it immediately.
 
-**Step 10 — quarantine**: Instead of calling `real_free(hdr)` now, we push
+**Step 11 — quarantine**: Instead of calling `real_free(hdr)` now, we push
 the block into the thread-local quarantine ring. This delays the actual free
 so the poison stays in place longer, increasing the window to catch UAF. See
 the Quarantine section below for the full algorithm.
@@ -367,14 +394,14 @@ realloc(ptr, size):
          memcpy(new, ptr, min(size, available))
          return new                            — can't free bootstrap, just abandon it
     4. resolve_real()
-    5. hdr = ptr - 24
+    5. hdr = ptr - 32
     6. check_canaries(hdr, ptr)                — check BEFORE resize!
     7. old_size = hdr->size
-    8. new_raw = real_realloc(hdr, 24 + size + 8)  — libc resizes the raw block
+    8. new_raw = real_realloc(hdr, 32 + size + 8)  — libc resizes the raw block
     9. if new_raw == NULL: return NULL
    10. new_hdr = (alloc_header_t *)new_raw
    11. new_hdr->size = size                    — update stored size
-   12. new_user = new_raw + 24
+   12. new_user = new_raw + 32
    13. if size > old_size:                     — if grown, junk-fill new portion
          memset(new_user + old_size, 0xAA, size - old_size)
    14. write_tail(new_user, size)              — write tail canary at new end
@@ -502,7 +529,7 @@ Additionally, every 64th eviction triggers a **full-buffer scan** — checking
 ALL bytes of the freed block against the poison pattern. This catches UAF
 writes that land between the 3 spot-check locations:
 
-- UAF writes to the header (bytes -24 to -1): **always detected**
+- UAF writes to the header (bytes -32 to -1): **always detected**
 - UAF writes to bytes 0-7: **always detected** (spot check)
 - UAF writes near the middle: **always detected** (spot check)
 - UAF writes near the end: **always detected** (spot check)
@@ -885,7 +912,7 @@ The harness sets `phase = 0` before parsing and `phase = 1` before cleanup.
 | UAF writes                | **Yes** (quarantine)   | No                     | **Yes**                 |
 | UAF reads                 | Partial (poison)       | No                     | **Yes** (immediate)     |
 | Uninit reads              | Partial (junk fill)    | No                     | MSan (separate tool)    |
-| Memory overhead           | ~32 bytes/alloc + quarantine | 1 page/alloc    | 1/8 of address space    |
+| Memory overhead           | ~40 bytes/alloc + quarantine | 1 page/alloc    | 1/8 of address space    |
 | False positives           | None                   | OOM in persistent mode | None                    |
 
 **Key insight**: ASan is the gold standard but requires source code and
@@ -944,7 +971,7 @@ tail IS a real bug), but the backtrace might not show the exact corrupting threa
 
 ### Memory overhead
 
-- Per allocation: 32 bytes extra (24-byte header + 8-byte tail canary)
+- Per allocation: 40 bytes extra (32-byte header + 8-byte tail canary)
 - Quarantine: up to 256 freed blocks per thread held in memory
 - Registry: 65536 pointer slots (512KB static array)
 - Guard pages: 2 extra 4KB pages per allocation >= 64KB
@@ -1013,7 +1040,7 @@ LiteSan is a pure LD_PRELOAD shim. It works with the existing
 
 ```
 custom_sanitizer/
-├── litesan.c                 — Source (~700 lines)
+├── litesan.c                 — Source (~800 lines)
 ├── litesan.so                — Compiled library (-O3)
 ├── README.md                 — This file
 ├── .gitignore
@@ -1084,11 +1111,12 @@ this is a shorter window than a shared 2048-slot quarantine would provide.
 For multi-threaded targets (e.g., Foxit with 10 threads), total capacity is
 256 x 10 = 2560 slots — comparable to or better than a shared approach.
 
-### 2. Bigger header (24 bytes vs 16 bytes)
+### 2. Bigger header (32 bytes vs 16 bytes)
 
-Every allocation uses 32 bytes of overhead (24-byte header + 8-byte tail).
-For programs that do millions of tiny `malloc(8)` calls, this means 4x the
-requested size per allocation.
+Every allocation uses 40 bytes of overhead (32-byte header + 8-byte tail).
+For programs that do millions of tiny `malloc(8)` calls, this means 5x the
+requested size per allocation. The extra 8 bytes (vs a minimal header) store
+the alloc-site return address for diagnostics.
 
 ### 3. Guard page allocs are slower than regular malloc
 

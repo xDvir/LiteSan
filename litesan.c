@@ -14,10 +14,15 @@
  *   6. Bitmask for scan interval check (& instead of %)
  *
  *   Detection (zero/near-zero cost):
- *   7. Free-site stored in header on free (reuses size field for diagnostics)
+ *   7. Free-site stored in header on free (reuses underflow field for diagnostics)
  *   8. Sampled full-buffer poison check (1-in-64 full scan on eviction)
  *   9. Heap underflow detection (8-byte pre-header red zone)
- *   10. Guard page for huge allocations (>= 64KB, mmap+mprotect)
+ *   10. Guard page for huge allocations (>= 64KB, mmap+mprotect, right-aligned)
+ *   11. Alloc-site tracking (return address stored in header)
+ *   12. Combined XOR quarantine spot-check (3 branches → 1)
+ *   13. Prefetch quarantine eviction target (hides memory latency)
+ *   14. Integer overflow protection on allocation size
+ *   15. malloc_usable_size / reallocarray interception
  *
  * Build:
  *   gcc -shared -fPIC -O3 -o litesan.so litesan.c -ldl -rdynamic
@@ -47,18 +52,19 @@
 #define POISON_BYTE     0xFE
 #define JUNK_BYTE       0xAA
 
-/* v3: Header layout:
- *   [underflow_canary (8B)][size (8B)][canary (8B)][user data ...][tail_canary (8B)]
- * The underflow canary sits BEFORE the original header, detecting writes
- * before the allocation (heap underflow / out-of-bounds write backward).
+/* Header layout:
+ *   [underflow(8B)][alloc_site(8B)][size(8B)][canary(8B)][user data ...][tail(8B)]
+ * The underflow canary sits at the start, detecting backward OOB writes.
+ * alloc_site stores the return address of the malloc caller (for diagnostics).
  */
 typedef struct {
-    uint64_t underflow;  /* v3: UNDERFLOW_CANARY — detects backward OOB writes */
-    size_t   size;       /* requested allocation size (overwritten with free-site on free) */
-    uint64_t canary;     /* HEAD_CANARY (live) or FREED_CANARY (freed) */
+    uint64_t underflow;    /* UNDERFLOW_CANARY — detects backward OOB writes */
+    uint64_t alloc_site;   /* return address of malloc caller (diagnostics) */
+    size_t   size;         /* requested allocation size */
+    uint64_t canary;       /* HEAD_CANARY (live) or FREED_CANARY (freed) */
 } alloc_header_t;
 
-#define HDR_SIZE  sizeof(alloc_header_t)   /* 24 */
+#define HDR_SIZE  sizeof(alloc_header_t)   /* 32 */
 #define TAIL_SIZE sizeof(uint64_t)         /* 8 */
 
 /* v3: Guard page threshold — huge allocations get mmap + guard page */
@@ -182,11 +188,11 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
     if (__builtin_expect(hdr->canary == FREED_CANARY, 0)) {
         fprintf(stderr,
             "\n*** LITESAN: DOUBLE-FREE in %s() ptr=%p ***\n", fn, user);
-        /* v3: show free-site if stored */
+        if (hdr->alloc_site)
+            fprintf(stderr, "    alloc-site: %p\n", (void *)(uintptr_t)hdr->alloc_site);
         if (hdr->underflow != UNDERFLOW_CANARY && hdr->underflow != GUARD_UNDERFLOW
-            && hdr->underflow != 0) {
+            && hdr->underflow != 0)
             fprintf(stderr, "    previous free-site: %p\n", (void *)hdr->underflow);
-        }
         print_backtrace();
         abort();
     }
@@ -217,6 +223,8 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
             "size=%zu expected=0x%llx got=0x%llx ***\n",
             fn, user, hdr->size, (unsigned long long)TAIL_CANARY,
             (unsigned long long)tail);
+        if (hdr->alloc_site)
+            fprintf(stderr, "    alloc-site: %p\n", (void *)(uintptr_t)hdr->alloc_site);
         print_backtrace();
         abort();
     }
@@ -250,59 +258,53 @@ static void check_quarantined(alloc_header_t *hdr) {
         abort();
     }
 
-    /* Spot-check first 8 bytes */
-    if (saved_size >= 8) {
-        uint64_t first8 = *(uint64_t *)user;
-        if (__builtin_expect(first8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
-            fprintf(stderr,
-                "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
-                "    ptr=%p size=%zu (freed data corrupted at offset 0, "
-                "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
-                user, saved_size, (unsigned long long)first8);
-            /* v3: show free-site if available */
-            if (hdr->underflow != UNDERFLOW_CANARY && hdr->underflow != 0) {
-                fprintf(stderr, "    free-site: %p\n", (void *)hdr->underflow);
-            }
-            print_backtrace();
-            abort();
-        }
-    }
+    /* Combined multi-spot check: XOR all spots together, single branch on happy path.
+     * On corruption, do a second pass to identify the exact offset. */
+    #define POISON64 0xFEFEFEFEFEFEFEFEULL
+    {
+        uint64_t bad = 0;
+        uint64_t first8 = 0, mid8 = 0, end8 = 0;
+        size_t mid_off = 0, end_off = 0;
 
-    /* Multi-spot: middle 8 bytes */
-    if (saved_size >= 24) {
-        size_t mid_off = (saved_size / 2) & ~(size_t)7;
-        uint64_t mid8 = *(uint64_t *)((char *)user + mid_off);
-        if (__builtin_expect(mid8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
+        if (saved_size >= 8) {
+            first8 = *(uint64_t *)user;
+            bad |= first8 ^ POISON64;
+        }
+        if (saved_size >= 24) {
+            mid_off = (saved_size / 2) & ~(size_t)7;
+            mid8 = *(uint64_t *)((char *)user + mid_off);
+            bad |= mid8 ^ POISON64;
+        }
+        if (saved_size >= 16) {
+            end_off = (saved_size - 8) & ~(size_t)7;
+            end8 = *(uint64_t *)((char *)user + end_off);
+            bad |= end8 ^ POISON64;
+        }
+
+        if (__builtin_expect(bad != 0, 0)) {
+            /* Identify which spot was corrupted for the error message */
+            size_t off = 0;
+            uint64_t got = first8;
+            if (first8 != POISON64) { off = 0; got = first8; }
+            else if (mid8 != POISON64) { off = mid_off; got = mid8; }
+            else { off = end_off; got = end8; }
+
             fprintf(stderr,
                 "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
                 "    ptr=%p size=%zu (freed data corrupted at offset %zu, "
                 "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
-                user, saved_size, mid_off, (unsigned long long)mid8);
+                user, saved_size, off, (unsigned long long)got);
             if (hdr->underflow != UNDERFLOW_CANARY && hdr->underflow != 0) {
                 fprintf(stderr, "    free-site: %p\n", (void *)hdr->underflow);
+            }
+            if (hdr->alloc_site) {
+                fprintf(stderr, "    alloc-site: %p\n", (void *)(uintptr_t)hdr->alloc_site);
             }
             print_backtrace();
             abort();
         }
     }
-
-    /* Multi-spot: last 8 bytes */
-    if (saved_size >= 16) {
-        size_t end_off = (saved_size - 8) & ~(size_t)7;
-        uint64_t end8 = *(uint64_t *)((char *)user + end_off);
-        if (__builtin_expect(end8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
-            fprintf(stderr,
-                "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
-                "    ptr=%p size=%zu (freed data corrupted at offset %zu, "
-                "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
-                user, saved_size, end_off, (unsigned long long)end8);
-            if (hdr->underflow != UNDERFLOW_CANARY && hdr->underflow != 0) {
-                fprintf(stderr, "    free-site: %p\n", (void *)hdr->underflow);
-            }
-            print_backtrace();
-            abort();
-        }
-    }
+    #undef POISON64
 
     /* v3: Sampled full-buffer check — every FULL_CHECK_INTERVAL evictions,
      * scan ALL bytes. Catches UAF writes that miss the 3 spot-checks. */
@@ -458,10 +460,12 @@ static inline void maybe_periodic_scan(void) {
 }
 
 /* ========================================================================= */
-/* Guard page allocations (v3: for huge allocs >= 64KB)                      */
+/* Guard page allocations (for huge allocs >= 64KB)                          */
 /*                                                                           */
-/* Layout: [guard_page(4K)][header(24B)][user_data(N)][tail(8B)][guard_page] */
-/* The trailing guard page is PROT_NONE — any overflow segfaults instantly.  */
+/* Layout (right-aligned):                                                   */
+/*   [guard(4K)][pad][header(32B)][user_data(N)][tail(8B)][guard(4K)]        */
+/* Right-aligned so tail canary ends near back guard page (max 7B gap).      */
+/* Any overflow past tail → instant SIGSEGV from guard page.                 */
 /* ========================================================================= */
 
 static inline size_t align_up(size_t n, size_t align) {
@@ -484,11 +488,14 @@ static void *guard_page_alloc(size_t size) {
     /* Back guard page: PROT_NONE (overflow past tail → instant segfault) */
     mprotect((char *)base + PAGE_SIZE_VAL + inner_pages, PAGE_SIZE_VAL, PROT_NONE);
 
-    /* Header sits right after front guard page */
-    alloc_header_t *hdr = (alloc_header_t *)((char *)base + PAGE_SIZE_VAL);
-    hdr->underflow = GUARD_UNDERFLOW;  /* marks this as a guard-page alloc */
-    hdr->size = size;
-    hdr->canary = HEAD_CANARY;
+    /* Right-align: place header+data+tail so tail ends near back guard page.
+     * Align offset down to 8 bytes for header alignment (max 7B gap). */
+    size_t offset = (inner_pages - inner) & ~(size_t)7;
+    alloc_header_t *hdr = (alloc_header_t *)((char *)base + PAGE_SIZE_VAL + offset);
+    hdr->underflow   = GUARD_UNDERFLOW;  /* marks this as a guard-page alloc */
+    hdr->alloc_site  = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    hdr->size        = size;
+    hdr->canary      = HEAD_CANARY;
 
     void *user = (char *)hdr + HDR_SIZE;
     fast_memset(user, JUNK_BYTE, size);
@@ -503,9 +510,11 @@ static void guard_page_free(alloc_header_t *hdr, void *user) {
     size_t inner = HDR_SIZE + size + TAIL_SIZE;
     size_t inner_pages = align_up(inner, PAGE_SIZE_VAL);
     size_t total = PAGE_SIZE_VAL + inner_pages + PAGE_SIZE_VAL;
-    void *base = (char *)hdr - PAGE_SIZE_VAL;
 
-    /* Re-protect front guard so we can check header */
+    /* Recover base from right-aligned header position */
+    size_t offset = (inner_pages - inner) & ~(size_t)7;
+    void *base = (char *)hdr - PAGE_SIZE_VAL - offset;
+
     registry_remove(hdr);
 
     /* No quarantine for guard page allocs — munmap is instant cleanup */
@@ -591,7 +600,12 @@ static void quarantine_push(alloc_header_t *hdr) {
 /* Internal allocation                                                       */
 /* ========================================================================= */
 
+__attribute__((hot))
 static inline void *malloc_internal(size_t size, int junk_fill) {
+    /* Reject sizes that would overflow the total allocation */
+    if (__builtin_expect(size + HDR_SIZE + TAIL_SIZE < size, 0))
+        return NULL;
+
     /* v3: Guard page for huge allocations */
     if (__builtin_expect(size >= GUARD_PAGE_THRESHOLD, 0)) {
         return guard_page_alloc(size);
@@ -601,9 +615,10 @@ static inline void *malloc_internal(size_t size, int junk_fill) {
     if (__builtin_expect(!raw, 0)) return NULL;
 
     alloc_header_t *hdr = (alloc_header_t *)raw;
-    hdr->underflow = UNDERFLOW_CANARY;  /* v3: underflow red zone */
-    hdr->size      = size;
-    hdr->canary    = HEAD_CANARY;
+    hdr->underflow   = UNDERFLOW_CANARY;
+    hdr->alloc_site  = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    hdr->size        = size;
+    hdr->canary      = HEAD_CANARY;
 
     void *user = (char *)raw + HDR_SIZE;
     if (junk_fill)
@@ -618,12 +633,14 @@ static inline void *malloc_internal(size_t size, int junk_fill) {
 /* Public API overrides                                                      */
 /* ========================================================================= */
 
+__attribute__((hot))
 void *malloc(size_t size) {
     if (__builtin_expect(!real_malloc, 0)) resolve_real();
     if (__builtin_expect(!real_malloc, 0)) return NULL;
     return malloc_internal(size, 1);
 }
 
+__attribute__((hot))
 void free(void *ptr) {
     if (!ptr) return;
     if (__builtin_expect(is_bootstrap(ptr), 0)) return;
@@ -641,9 +658,17 @@ void free(void *ptr) {
     check_canaries(hdr, ptr, "free");
     registry_remove(hdr);
 
-    /* v3: Store return address (free-site) in underflow field for diagnostics.
+    /* Store return address (free-site) in underflow field for diagnostics.
      * The underflow canary was already verified in check_canaries above. */
     hdr->underflow = (uint64_t)(uintptr_t)__builtin_return_address(0);
+
+    /* Prefetch the quarantine slot that will be evicted — hide memory latency
+     * behind the memset work below */
+    {
+        size_t q_idx = tl_q.idx % TL_QUARANTINE_SIZE;
+        void *evict = tl_q.ring[q_idx];
+        if (evict) __builtin_prefetch(evict, 0, 0);
+    }
 
     /* Poison user data + tail for UAF detection */
     memset(ptr, POISON_BYTE, hdr->size + TAIL_SIZE);
@@ -760,4 +785,22 @@ void *valloc(size_t size) {
 
 void *pvalloc(size_t size) {
     return malloc(size);
+}
+
+/* ========================================================================= */
+/* Additional API interception                                               */
+/* ========================================================================= */
+
+size_t malloc_usable_size(void *ptr) {
+    if (!ptr) return 0;
+    if (__builtin_expect(is_bootstrap(ptr), 0)) return 0;
+    alloc_header_t *hdr = (alloc_header_t *)((char *)ptr - HDR_SIZE);
+    return hdr->size;
+}
+
+void *reallocarray(void *ptr, size_t nmemb, size_t size) {
+    size_t total = nmemb * size;
+    if (__builtin_expect(nmemb != 0 && total / nmemb != size, 0))
+        return NULL;
+    return realloc(ptr, total);
 }
