@@ -1,9 +1,9 @@
-/* Test: realistic overflow via strcpy (string longer than buffer) */
+/* Test: overflow via strcpy */
 #include <stdlib.h>
 #include <string.h>
 int main(void) {
-    char *buf = malloc(8);
-    strcpy(buf, "AABBCCDDEE");  /* 10 chars + NUL = 11 bytes into 8-byte buffer */
-    free(buf);
+    char *p = malloc(8);
+    strcpy(p, "this string is way too long for 8 bytes");
+    free(p);
     return 0;
 }

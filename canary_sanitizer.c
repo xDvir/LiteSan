@@ -1,15 +1,24 @@
 /*
- * canary_sanitizer.so — Lightweight heap sanitizer for persistent mode fuzzing
+ * canary_sanitizer.so v2 — Lightweight heap sanitizer for persistent mode fuzzing
  *
- * LD_PRELOAD shim: overrides malloc/free/calloc/realloc with canary-guarded
- * versions. Uses normal libc malloc internally — no mmap per alloc, no syscall
- * explosion, no VMA accumulation. ~3% overhead vs 1,510% for libdislocator.
+ * LD_PRELOAD shim: overrides malloc/free/calloc/realloc/memalign/posix_memalign/
+ * aligned_alloc with canary-guarded versions. Uses normal libc malloc internally —
+ * no mmap per alloc, no syscall explosion, no VMA accumulation.
+ *
+ * v2 improvements over v1:
+ *   - Resolve libc functions once in constructor (not every call)
+ *   - Calloc skips junk fill (avoids double-write)
+ *   - Thread-local op counter (no atomic on hot path)
+ *   - __builtin_expect on cold error paths
+ *   - Multi-spot UAF check (first/middle/last 8 bytes)
+ *   - Intercept memalign/posix_memalign/aligned_alloc/valloc
+ *   - calloc integer overflow protection
  *
  * Detects:
  *   - Heap buffer overflow  (tail canary corrupted, checked on free/realloc)
  *   - Overflow without free (exit/signal/periodic registry scan)
  *   - Double-free           (head canary is poison from first free)
- *   - UAF writes            (quarantine keeps freed blocks, re-checks on eviction)
+ *   - UAF writes            (quarantine keeps freed blocks, multi-spot re-check on eviction)
  *   - UAF reads (partial)   (freed memory poisoned with 0xFE)
  *   - Uninitialized reads   (new allocs filled with 0xAA junk)
  *
@@ -32,6 +41,7 @@
 #include <stdio.h>
 #include <execinfo.h>
 #include <signal.h>
+#include <errno.h>
 
 /* ========================================================================= */
 /* Canary values                                                             */
@@ -44,7 +54,7 @@
 #define JUNK_BYTE    0xAA   /* fill new allocs — catches uninitialized reads */
 
 /* Header prepended to every allocation:
- *   [size (8 bytes)][head_canary (8 bytes)][user data ...][tail_canary (8 bytes)]
+ *   [size (8B)][canary (8B)][user data ...][tail_canary (8B)]
  */
 typedef struct {
     size_t   size;
@@ -85,8 +95,10 @@ static volatile size_t q_idx = 0;
 #define SCAN_INTERVAL  1024
 
 static void * volatile registry[REGISTRY_SIZE];
-static volatile size_t op_count = 0;
 static volatile int already_scanned = 0;
+
+/* v2: thread-local counter — no atomic on hot path */
+static __thread size_t tl_op_count = 0;
 
 static inline size_t registry_hash(void *ptr) {
     return ((uintptr_t)ptr >> 4) & REGISTRY_MASK;
@@ -133,7 +145,7 @@ static inline void write_tail(void *user, size_t size) {
 static void print_backtrace(void) {
     void *frames[32];
     int n = backtrace(frames, 32);
-    if (n > 0) {
+    if (__builtin_expect(n > 0, 1)) {
         fprintf(stderr, "Backtrace:\n");
         backtrace_symbols_fd(frames, n, STDERR_FILENO);
     }
@@ -141,13 +153,13 @@ static void print_backtrace(void) {
 
 /* Check canaries on a LIVE allocation (in malloc/free/realloc) */
 static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
-    if (hdr->canary == FREED_CANARY) {
+    if (__builtin_expect(hdr->canary == FREED_CANARY, 0)) {
         fprintf(stderr,
             "\n*** CANARY_SANITIZER: DOUBLE-FREE in %s() ptr=%p ***\n", fn, user);
         print_backtrace();
         abort();
     }
-    if (hdr->canary != HEAD_CANARY) {
+    if (__builtin_expect(hdr->canary != HEAD_CANARY, 0)) {
         fprintf(stderr,
             "\n*** CANARY_SANITIZER: HEAD CANARY corrupt in %s() ptr=%p "
             "expected=0x%llx got=0x%llx ***\n",
@@ -157,7 +169,7 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
         abort();
     }
     uint64_t tail = *(uint64_t *)((char *)user + hdr->size);
-    if (tail != TAIL_CANARY) {
+    if (__builtin_expect(tail != TAIL_CANARY, 0)) {
         fprintf(stderr,
             "\n*** CANARY_SANITIZER: HEAP BUFFER OVERFLOW in %s() ptr=%p "
             "size=%zu expected=0x%llx got=0x%llx ***\n",
@@ -168,13 +180,14 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
     }
 }
 
-/* Check a QUARANTINED block on eviction — detects UAF writes */
+/* v2: Check a QUARANTINED block on eviction — multi-spot UAF write detection.
+ * Checks first, middle, and last 8 bytes instead of just the first 8. */
 static void check_quarantined(alloc_header_t *hdr) {
     void *user = (char *)hdr + HDR_SIZE;
 
     /* Head canary should still be FREED_CANARY from when we freed it.
      * If it's different, someone wrote to the block after free (UAF write). */
-    if (hdr->canary != FREED_CANARY) {
+    if (__builtin_expect(hdr->canary != FREED_CANARY, 0)) {
         fprintf(stderr,
             "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
             "    ptr=%p size=%zu (header corrupted after free, "
@@ -185,16 +198,45 @@ static void check_quarantined(alloc_header_t *hdr) {
         abort();
     }
 
-    /* Spot-check first 8 bytes of user data — should still be 0xFE poison.
-     * If different, someone wrote into freed memory (UAF write). */
+    /* Spot-check first 8 bytes of user data */
     if (hdr->size >= 8) {
         uint64_t first8 = *(uint64_t *)user;
-        if (first8 != 0xFEFEFEFEFEFEFEFEULL) {
+        if (__builtin_expect(first8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
             fprintf(stderr,
                 "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
-                "    ptr=%p size=%zu (freed data corrupted, "
+                "    ptr=%p size=%zu (freed data corrupted at offset 0, "
                 "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
                 user, hdr->size, (unsigned long long)first8);
+            print_backtrace();
+            abort();
+        }
+    }
+
+    /* v2: Spot-check middle 8 bytes */
+    if (hdr->size >= 24) {
+        size_t mid_off = (hdr->size / 2) & ~(size_t)7;
+        uint64_t mid8 = *(uint64_t *)((char *)user + mid_off);
+        if (__builtin_expect(mid8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
+            fprintf(stderr,
+                "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
+                "    ptr=%p size=%zu (freed data corrupted at offset %zu, "
+                "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
+                user, hdr->size, mid_off, (unsigned long long)mid8);
+            print_backtrace();
+            abort();
+        }
+    }
+
+    /* v2: Spot-check last 8 bytes */
+    if (hdr->size >= 16) {
+        size_t end_off = (hdr->size - 8) & ~(size_t)7;
+        uint64_t end8 = *(uint64_t *)((char *)user + end_off);
+        if (__builtin_expect(end8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
+            fprintf(stderr,
+                "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
+                "    ptr=%p size=%zu (freed data corrupted at offset %zu, "
+                "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
+                user, hdr->size, end_off, (unsigned long long)end8);
             print_backtrace();
             abort();
         }
@@ -258,7 +300,7 @@ static void scan_registry(int is_signal) {
         void *user = (char *)hdr + HDR_SIZE;
 
         /* Check head canary */
-        if (hdr->canary != HEAD_CANARY) {
+        if (__builtin_expect(hdr->canary != HEAD_CANARY, 0)) {
             if (is_signal) {
                 safe_write("\n*** CANARY_SANITIZER: HEAD CANARY corrupt "
                            "(registry scan) ptr=");
@@ -270,6 +312,7 @@ static void scan_registry(int is_signal) {
                     "(registry scan) ptr=%p expected=0x%llx got=0x%llx ***\n",
                     user, (unsigned long long)HEAD_CANARY,
                     (unsigned long long)hdr->canary);
+
                 print_backtrace();
             }
             found_corruption = 1;
@@ -278,7 +321,7 @@ static void scan_registry(int is_signal) {
 
         /* Check tail canary */
         uint64_t tail = *(uint64_t *)((char *)user + hdr->size);
-        if (tail != TAIL_CANARY) {
+        if (__builtin_expect(tail != TAIL_CANARY, 0)) {
             if (is_signal) {
                 safe_write("\n*** CANARY_SANITIZER: HEAP BUFFER OVERFLOW "
                            "(registry scan) ptr=");
@@ -300,6 +343,7 @@ static void scan_registry(int is_signal) {
                     "expected=0x%llx got=0x%llx ***\n",
                     user, hdr->size, (unsigned long long)TAIL_CANARY,
                     (unsigned long long)tail);
+
                 print_backtrace();
             }
             found_corruption = 1;
@@ -310,9 +354,9 @@ static void scan_registry(int is_signal) {
         abort();
 }
 
-static void maybe_periodic_scan(void) {
-    size_t count = __sync_fetch_and_add(&op_count, 1);
-    if (count > 0 && (count % SCAN_INTERVAL) == 0)
+/* v2: thread-local counter, no atomic on hot path */
+static inline void maybe_periodic_scan(void) {
+    if (__builtin_expect(++tl_op_count % SCAN_INTERVAL == 0, 0))
         scan_registry(0);
 }
 
@@ -356,8 +400,10 @@ static void crash_signal_handler(int sig, siginfo_t *info, void *ucontext) {
     }
 }
 
+/* v2: resolve libc functions ONCE in constructor */
 __attribute__((constructor))
 static void canary_sanitizer_init(void) {
+    resolve_real();
     atexit(atexit_scan);
 
     struct sigaction sa;
@@ -371,32 +417,43 @@ static void canary_sanitizer_init(void) {
 }
 
 /* ========================================================================= */
-/* Public API overrides                                                      */
+/* Internal allocation (v2: shared by malloc and calloc)                     */
 /* ========================================================================= */
 
-void *malloc(size_t size) {
-    resolve_real();
-    if (!real_malloc) return NULL;
-
+static inline void *malloc_internal(size_t size, int junk_fill) {
     void *raw = real_malloc(HDR_SIZE + size + TAIL_SIZE);
-    if (!raw) return NULL;
+    if (__builtin_expect(!raw, 0)) return NULL;
 
     alloc_header_t *hdr = (alloc_header_t *)raw;
     hdr->size   = size;
     hdr->canary = HEAD_CANARY;
 
     void *user = (char *)raw + HDR_SIZE;
-    memset(user, JUNK_BYTE, size);  /* junk fill — catches uninitialized reads */
+    if (junk_fill)
+        memset(user, JUNK_BYTE, size);
     write_tail(user, size);
     registry_add(hdr);
     maybe_periodic_scan();
     return user;
 }
 
+/* ========================================================================= */
+/* Public API overrides                                                      */
+/* ========================================================================= */
+
+void *malloc(size_t size) {
+    /* v2: resolve_real() already called in constructor. Fallback for edge case
+     * where malloc is called before constructor (should not happen on glibc). */
+    if (__builtin_expect(!real_malloc, 0)) resolve_real();
+    if (__builtin_expect(!real_malloc, 0)) return NULL;
+
+    return malloc_internal(size, 1);
+}
+
 void free(void *ptr) {
     if (!ptr) return;
-    if (is_bootstrap(ptr)) return;
-    resolve_real();
+    if (__builtin_expect(is_bootstrap(ptr), 0)) return;
+    if (__builtin_expect(!real_free, 0)) resolve_real();
 
     alloc_header_t *hdr = (alloc_header_t *)((char *)ptr - HDR_SIZE);
     check_canaries(hdr, ptr, "free");
@@ -404,6 +461,7 @@ void free(void *ptr) {
 
     /* Poison user data + tail for UAF detection */
     memset(ptr, POISON_BYTE, hdr->size + TAIL_SIZE);
+
     /* Mark freed (double-free detection + quarantine eviction check) */
     hdr->canary = FREED_CANARY;
 
@@ -424,12 +482,8 @@ void free(void *ptr) {
 }
 
 void *calloc(size_t nmemb, size_t size) {
-    /* Bootstrap buffer is ONLY for dlsym's internal calloc calls.
-     * When resolving == 1, we're inside dlsym() which needs calloc()
-     * but we can't use real_calloc yet (it's what we're resolving).
-     * The !real_malloc fallback handles the edge case where calloc is
-     * called from within resolve_real() before real_malloc is set. */
-    if (resolving) {
+    /* Bootstrap buffer is ONLY for dlsym's internal calloc calls. */
+    if (__builtin_expect(resolving, 0)) {
         size_t total = nmemb * size;
         if (bootstrap_used + total > sizeof(bootstrap_buf)) return NULL;
         void *p = bootstrap_buf + bootstrap_used;
@@ -437,11 +491,16 @@ void *calloc(size_t nmemb, size_t size) {
         memset(p, 0, total);
         return p;
     }
-    resolve_real();
-    if (!real_malloc) return NULL;
+    if (__builtin_expect(!real_malloc, 0)) resolve_real();
+    if (__builtin_expect(!real_malloc, 0)) return NULL;
 
+    /* v2: integer overflow check */
     size_t total = nmemb * size;
-    void *ptr = malloc(total);
+    if (__builtin_expect(nmemb != 0 && total / nmemb != size, 0))
+        return NULL;
+
+    /* v2: skip junk fill — calloc will zero it anyway */
+    void *ptr = malloc_internal(total, 0);
     if (ptr) memset(ptr, 0, total);
     return ptr;
 }
@@ -449,7 +508,7 @@ void *calloc(size_t nmemb, size_t size) {
 void *realloc(void *ptr, size_t size) {
     if (!ptr) return malloc(size);
     if (size == 0) { free(ptr); return NULL; }
-    if (is_bootstrap(ptr)) {
+    if (__builtin_expect(is_bootstrap(ptr), 0)) {
         void *new_ptr = malloc(size);
         if (new_ptr) {
             size_t avail = (bootstrap_buf + sizeof(bootstrap_buf)) - (char *)ptr;
@@ -457,7 +516,7 @@ void *realloc(void *ptr, size_t size) {
         }
         return new_ptr;
     }
-    resolve_real();
+    if (__builtin_expect(!real_realloc, 0)) resolve_real();
 
     alloc_header_t *hdr = (alloc_header_t *)((char *)ptr - HDR_SIZE);
     /* Check canaries BEFORE realloc — detects overflow on the old buffer */
@@ -468,7 +527,7 @@ void *realloc(void *ptr, size_t size) {
 
     /* Let libc handle the resize — may grow in-place without copying */
     void *new_raw = real_realloc(hdr, HDR_SIZE + size + TAIL_SIZE);
-    if (!new_raw) {
+    if (__builtin_expect(!new_raw, 0)) {
         registry_add(hdr);  /* realloc failed — old block is still live */
         return NULL;
     }
@@ -487,4 +546,40 @@ void *realloc(void *ptr, size_t size) {
     registry_add(new_hdr);
     maybe_periodic_scan();
     return new_user;
+}
+
+/* ========================================================================= */
+/* v2: Aligned allocation interception                                       */
+/*                                                                           */
+/* Programs using memalign/posix_memalign/aligned_alloc/valloc bypass the    */
+/* sanitizer entirely if not intercepted. We redirect to our malloc — this   */
+/* sacrifices alignment guarantees (acceptable during fuzzing) but ensures   */
+/* every heap allocation gets canary protection.                             */
+/* ========================================================================= */
+
+void *memalign(size_t alignment, size_t size) {
+    (void)alignment; /* alignment not honored — canary layout takes priority */
+    return malloc(size);
+}
+
+int posix_memalign(void **memptr, size_t alignment, size_t size) {
+    (void)alignment;
+    if (!memptr) return EINVAL;
+    void *p = malloc(size);
+    if (!p) return ENOMEM;
+    *memptr = p;
+    return 0;
+}
+
+void *aligned_alloc(size_t alignment, size_t size) {
+    (void)alignment;
+    return malloc(size);
+}
+
+void *valloc(size_t size) {
+    return malloc(size);
+}
+
+void *pvalloc(size_t size) {
+    return malloc(size);
 }

@@ -1,11 +1,9 @@
-/* Test: overflow detected on realloc (not free) */
+/* Test: overflow detected during realloc */
 #include <stdlib.h>
-#include <string.h>
 int main(void) {
-    char *p = malloc(20);
-    memset(p, 'D', 20);
-    p[20] = 'X';              /* overflow */
-    p = realloc(p, 40);       /* check_canaries runs BEFORE resize */
+    char *p = malloc(16);
+    p[16] = 'X';  /* overflow */
+    p = realloc(p, 32);  /* should catch overflow on old buffer */
     free(p);
     return 0;
 }

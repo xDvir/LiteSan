@@ -1,11 +1,9 @@
-/* Test: off-by-one in a loop (classic fence-post error) */
+/* Test: overflow via loop (classic off-by-one) */
 #include <stdlib.h>
 int main(void) {
-    int n = 100;
-    char *p = malloc(n);
-    for (int i = 0; i <= n; i++) {  /* bug: <= instead of < */
-        p[i] = 'x';
-    }
+    int *p = malloc(10 * sizeof(int));
+    for (int i = 0; i <= 10; i++)  /* <= instead of < */
+        p[i] = i;
     free(p);
     return 0;
 }

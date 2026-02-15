@@ -3,21 +3,17 @@
 #include <stdio.h>
 #include <stdint.h>
 int main(void) {
-    uint64_t *p = (uint64_t *)malloc(64);
-
-    /* Check all 8 uint64_t values are 0xAAAAAAAAAAAAAAAA */
-    int pass = 1;
-    for (int i = 0; i < 8; i++) {
-        if (p[i] != 0xAAAAAAAAAAAAAAAAULL) {
-            fprintf(stderr, "FAIL: p[%d] = 0x%llx (expected 0xAAAAAAAAAAAAAAAA)\n",
-                    i, (unsigned long long)p[i]);
-            pass = 0;
+    char *p = malloc(64);
+    /* Check that all bytes are 0xAA */
+    for (int i = 0; i < 64; i++) {
+        if ((unsigned char)p[i] != 0xAA) {
+            fprintf(stderr, "FAIL: byte %d is 0x%02x, expected 0xAA\n",
+                    i, (unsigned char)p[i]);
+            free(p);
+            return 1;
         }
     }
+    fprintf(stderr, "PASS: all bytes are 0xAA\n");
     free(p);
-    if (pass) {
-        fprintf(stderr, "PASS: all 64 bytes are 0xAA junk fill\n");
-        return 0;
-    }
-    return 1;
+    return 0;
 }

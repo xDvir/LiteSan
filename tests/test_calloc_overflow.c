@@ -1,10 +1,8 @@
-/* Test: calloc'd memory still has canaries (overflow detected on free) */
+/* Test: overflow on calloc allocation */
 #include <stdlib.h>
-#include <string.h>
 int main(void) {
     char *p = calloc(1, 32);
-    memset(p, 'E', 32);
-    p[32] = 'X';  /* overflow past calloc'd block */
-    free(p);       /* should catch tail canary corruption */
+    p[32] = 'X';
+    free(p);
     return 0;
 }

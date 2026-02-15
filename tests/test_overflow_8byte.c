@@ -1,9 +1,9 @@
-/* Test: 8-byte heap buffer overflow (overwrites entire tail canary) */
+/* Test: 8-byte buffer overflow detected on free */
 #include <stdlib.h>
 #include <string.h>
 int main(void) {
     char *p = malloc(64);
-    memset(p, 'B', 64 + 8);  /* overwrite all 8 bytes of tail canary */
+    memset(p + 64, 'A', 8);  /* 8-byte overflow */
     free(p);
     return 0;
 }

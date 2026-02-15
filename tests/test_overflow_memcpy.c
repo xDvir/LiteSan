@@ -1,11 +1,11 @@
-/* Test: overflow via memcpy with wrong size */
+/* Test: overflow via memcpy */
 #include <stdlib.h>
 #include <string.h>
 int main(void) {
-    char src[100];
-    memset(src, 'M', 100);
-    char *dst = malloc(50);
-    memcpy(dst, src, 100);  /* copies 100 bytes into 50-byte buffer */
-    free(dst);
+    char *p = malloc(16);
+    char src[64];
+    memset(src, 'Z', 64);
+    memcpy(p, src, 64);  /* copies 64 bytes into 16-byte buffer */
+    free(p);
     return 0;
 }

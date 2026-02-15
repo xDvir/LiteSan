@@ -1,27 +1,16 @@
-/* Test: many reallocs on same pointer — canaries must survive each resize */
+/* Test: many realloc operations — no false positives */
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 int main(void) {
-    char *p = malloc(1);
-    p[0] = 'x';
-
-    /* Grow from 1 to 10000 in steps */
-    for (int sz = 2; sz <= 10000; sz += sz / 2 + 1) {
-        int old_sz = (sz - 1 > 0) ? sz - 1 : 1;
-        p = realloc(p, sz);
-        if (!p) { fprintf(stderr, "FAIL: realloc returned NULL at sz=%d\n", sz); return 1; }
-        /* Write to last byte — must NOT corrupt tail canary */
-        p[sz - 1] = 'y';
+    char *p = malloc(16);
+    memset(p, 'A', 16);
+    for (int i = 0; i < 500; i++) {
+        size_t new_size = 16 + (i * 7) % 4096;
+        p = realloc(p, new_size);
+        /* Touch the whole buffer within bounds */
+        p[0] = 'X';
+        p[new_size - 1] = 'Y';
     }
-
-    /* Shrink back down */
-    for (int sz = 5000; sz >= 1; sz /= 2) {
-        p = realloc(p, sz);
-        if (!p) { fprintf(stderr, "FAIL: realloc shrink returned NULL at sz=%d\n", sz); return 1; }
-    }
-
     free(p);
-    fprintf(stderr, "PASS: many reallocs (grow + shrink) — canaries intact\n");
     return 0;
 }
