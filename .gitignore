@@ -2,4 +2,5 @@
 *.o
 tests/build/
 custom_mutator_v2/tests/build/
+canary_sanitizer_v3/tests/build/
 _backup-san/
