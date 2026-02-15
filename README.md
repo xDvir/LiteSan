@@ -22,7 +22,7 @@
 18. [Limitations and Trade-offs](#limitations-and-trade-offs)
 19. [Build and Usage](#build-and-usage)
 20. [Files](#files)
-21. [v3: Maximum Speed Variant](#v3-maximum-speed-variant)
+21. [Honest Trade-offs](#honest-trade-offs)
 
 ---
 
@@ -68,29 +68,29 @@ never actually started fuzzing.
 
 **Overhead: ~3% (1.35x)** vs 1,510% (14.5x) for libdislocator.
 
-### v2 Improvements (current version)
-
-The sanitizer has been upgraded from v1 to v2 with the following improvements,
-all at equal or better speed:
+### Key Features
 
 - **Constructor-resolved libc functions** — `dlsym()` runs once at library load
-  in `__attribute__((constructor))` instead of checking `if (real_malloc)` on
-  every malloc/free call. Eliminates a branch from the hottest path.
-- **Calloc skips junk fill** — v1 junk-filled with 0xAA then immediately zeroed.
-  v2 skips the junk fill for calloc since it zeros anyway. ~6% faster calloc.
-- **Thread-local periodic scan counter** — v1 used `__sync_fetch_and_add` (atomic
-  `lock xadd`) on every malloc and free for the periodic scan counter. v2 uses a
-  `__thread` local variable — no atomic, no cache-line bouncing between cores.
-- **`__builtin_expect` on error paths** — all canary mismatch checks are hinted
-  as unlikely, helping branch prediction and instruction cache layout.
-- **Multi-spot UAF check** — v1 only checked the first 8 bytes of freed memory
-  on quarantine eviction. v2 checks first, middle, and last 8 bytes. Catches
-  UAF writes at any region of the buffer for the cost of 2 extra loads.
-- **Aligned allocator interception** — v1 didn't intercept `memalign`,
-  `posix_memalign`, `aligned_alloc`, `valloc`, or `pvalloc`. Programs using
-  these bypassed the sanitizer entirely. v2 intercepts all of them.
+  in `__attribute__((constructor))`. No per-call branches.
+- **Thread-local quarantine** — each thread has its own 256-slot ring buffer.
+  Zero atomics on `free()`, zero contention between cores.
+- **Fibonacci multiply-shift hash** — `ptr * 0x9E3779B97F4A7C15 >> 48` for
+  better distribution in the registry, fewer probe chains.
+- **Incremental registry scan** — scans 1/64th (1024 slots) per trigger instead
+  of all 65,536. Same coverage over time, 64x less work per trigger.
+- **Inline memset** for allocations <= 64 bytes (the common case).
+- **Multi-spot + sampled full-buffer UAF check** — 3 spot-checks on every
+  eviction, plus a full byte scan every 64th eviction.
+- **Heap underflow detection** — 8-byte red zone before the header.
+- **Guard pages for huge allocs** (>= 64KB) — `mmap` + `PROT_NONE` pages
+  before and after. Hardware-enforced overflow/underflow detection.
+- **Free-site diagnostics** — stores caller address on `free()`, prints it
+  when UAF or double-free is detected.
+- **Aligned allocator interception** — `memalign`, `posix_memalign`,
+  `aligned_alloc`, `valloc`, `pvalloc` all instrumented.
 - **calloc integer overflow protection** — `calloc(nmemb, size)` where
-  `nmemb * size` overflows now returns NULL instead of a dangerously small buffer.
+  `nmemb * size` overflows returns NULL.
+- **-O3 build** with `__builtin_expect` on all error paths.
 
 ---
 
@@ -195,45 +195,61 @@ The bootstrap window is extremely short: just the 4 `dlsym()` calls during
 
 ## Memory Layout: How Every Allocation Looks
 
-When the program calls `malloc(N)`, we actually allocate `N + 24` bytes from
+When the program calls `malloc(N)`, we actually allocate `N + 32` bytes from
 libc and lay them out like this:
 
 ```
- What libc                        What the program
- allocates                        sees (returned ptr)
- ┌──────────┐                     │
- │          ▼                     ▼
- ┌──────────┬──────────┬──────────────────────────┬──────────┐
- │  size    │  head    │    user data             │  tail    │
- │  (8B)   │  canary  │    (N bytes)             │  canary  │
- │          │  (8B)   │                          │  (8B)   │
- └──────────┴──────────┴──────────────────────────┴──────────┘
- ◄─── HDR_SIZE (16B) ──►◄────── N bytes ─────────►◄─ 8B ───►
+ What libc                                  What the program
+ allocates                                  sees (returned ptr)
+ ┌──────────┐                               │
+ │          ▼                               ▼
+ ┌──────────┬──────────┬──────────┬─────────────────────────┬──────────┐
+ │underflow │  size    │  head    │    user data            │  tail    │
+ │  canary  │  (8B)   │  canary  │    (N bytes)            │  canary  │
+ │  (8B)   │          │  (8B)   │                         │  (8B)   │
+ └──────────┴──────────┴──────────┴─────────────────────────┴──────────┘
+ ◄──────── HDR_SIZE (24B) ────────►◄────── N bytes ─────────►◄─ 8B ───►
 
- Total libc allocation = 16 + N + 8 = N + 24 bytes
+ Total libc allocation = 24 + N + 8 = N + 32 bytes
 ```
 
-The `alloc_header_t` struct is the first 16 bytes:
+The `alloc_header_t` struct is the first 24 bytes:
 
 ```c
 typedef struct {
+    uint64_t underflow; // 8 bytes: UNDERFLOW_CANARY (red zone before header)
     size_t   size;      // 8 bytes: the original requested size N
     uint64_t canary;    // 8 bytes: HEAD_CANARY (live) or FREED_CANARY (freed)
 } alloc_header_t;
 ```
 
-The **user pointer** (what `malloc` returns to the caller) points to byte 16 —
+The **underflow canary** is an 8-byte red zone before the size/canary fields. If
+something writes backward past the start of a preceding allocation, it corrupts
+this value → detected on `free()` or `realloc()`.
+
+The **user pointer** (what `malloc` returns to the caller) points to byte 24 —
 right after the header. The caller doesn't know about the header or tail canary.
 
 The **tail canary** is an 8-byte value written at `user_ptr + size`, immediately
 after the user's data. If the program writes past its allocation, it overwrites
 this value, and we detect it on the next `free()` or `realloc()`.
 
+### Huge allocations (>= 64KB): Guard page layout
+
+Allocations >= 64KB use `mmap` with hardware-enforced guard pages instead:
+
+```
+ [PROT_NONE guard (4KB)] [header(24)] [user data(N)] [tail(8)] [PROT_NONE guard (4KB)]
+```
+
+Any overflow or underflow beyond the guard pages triggers an instant SIGSEGV
+from the CPU — no need to wait for `free()` to check canaries.
+
 ---
 
 ## Algorithm: malloc()
 
-v2 uses an internal `malloc_internal(size, junk_fill)` function shared by both
+Uses an internal `malloc_internal(size, junk_fill)` function shared by both
 `malloc()` and `calloc()`. The `junk_fill` flag controls whether 0xAA fill is
 applied (1 for malloc, 0 for calloc since calloc zeroes anyway).
 
@@ -241,19 +257,24 @@ Libc function pointers are resolved once in `__attribute__((constructor))` at
 library load time. A fallback `resolve_real()` check is kept in `malloc()` for
 edge cases, but it's hinted `__builtin_expect(!real_malloc, 0)`.
 
+For allocations >= 64KB, a separate `guard_page_alloc()` path is used (see
+Memory Layout above).
+
 ```
 malloc(size):
     1. (libc pointers already resolved in constructor)
-    2. raw = real_malloc(16 + size + 8) — ask libc for extra space
-    3. hdr = (alloc_header_t *)raw
-    4. hdr->size   = size              — remember the requested size
-    5. hdr->canary = HEAD_CANARY       — write 0xDEADBEEFCAFEBABE
-    6. user = raw + 16                 — user pointer starts after header
-    7. memset(user, 0xAA, size)        — junk fill (uninitialized read detection)
-    8. write_tail(user, size)          — write 0xFEEDFACE8BADF00D after user data
-    9. registry_add(hdr)               — track in allocation registry
-   10. maybe_periodic_scan()           — thread-local counter, no atomic
-   11. return user                     — caller gets pointer to step 6
+    2. if size >= 64KB: return guard_page_alloc(size)
+    3. raw = real_malloc(24 + size + 8) — ask libc for extra space
+    4. hdr = (alloc_header_t *)raw
+    5. hdr->underflow = UNDERFLOW_CANARY — write underflow red zone
+    6. hdr->size   = size              — remember the requested size
+    7. hdr->canary = HEAD_CANARY       — write 0xDEADBEEFCAFEBABE
+    8. user = raw + 24                 — user pointer starts after header
+    9. fast_memset/memset(user, 0xAA)  — junk fill (inline for <= 64 bytes)
+   10. write_tail(user, size)          — write 0xFEEDFACE8BADF00D after user data
+   11. registry_add(hdr)               — track in allocation registry (Fibonacci hash)
+   12. maybe_incremental_scan()        — scan 1/64th of registry if counter triggers
+   13. return user                     — caller gets pointer to step 8
 ```
 
 **Why junk fill (step 7)?** If we left the memory uninitialized (whatever libc
@@ -271,52 +292,67 @@ empty string). `0xAA` is almost never valid, making bugs more obvious.
 free(ptr):
     1. if ptr == NULL: return          — C standard: free(NULL) is a no-op
     2. if is_bootstrap(ptr): return    — came from bootstrap buffer, ignore
-    3. resolve_real()
-    4. hdr = ptr - 16                  — walk back to find our header
-    5. check_canaries(hdr, ptr)        — THE KEY CHECK (see below)
-    6. memset(ptr, 0xFE, size + 8)    — poison user data AND tail canary
-    7. hdr->canary = FREED_CANARY      — mark header as freed
-    8. quarantine_push(hdr)            — delay actual free (see Quarantine section)
+    3. if is_guard_page_alloc(ptr):    — huge alloc, use guard_page_free()
+         check_canaries + munmap
+         return
+    4. resolve_real()
+    5. hdr = ptr - 24                  — walk back to find our header
+    6. check_canaries(hdr, ptr)        — THE KEY CHECK (see below)
+    7. hdr->underflow = return_address — store free-site for diagnostics
+    8. memset(ptr, 0xFE, size + 8)    — poison user data AND tail canary
+    9. hdr->canary = FREED_CANARY      — mark header as freed
+   10. tl_quarantine_push(hdr)         — push to thread-local quarantine ring
 ```
 
-**Step 5 — check_canaries()** does three checks in order:
+**Step 6 — check_canaries()** does four checks in order:
 
 ```
 check_canaries(hdr, ptr):
     A. if hdr->canary == FREED_CANARY:
          → DOUBLE-FREE! This block was already freed.
+         → print free-site address from hdr->underflow
          → print backtrace, abort()
 
-    B. if hdr->canary != HEAD_CANARY:
-         → HEAD CANARY CORRUPT! Something wrote before the user data
-           (underflow), or the pointer is garbage.
+    B. if hdr->underflow != UNDERFLOW_CANARY (and != GUARD_UNDERFLOW):
+         → HEAP UNDERFLOW! Something wrote before this allocation.
          → print backtrace, abort()
 
-    C. tail = *(uint64_t *)(ptr + hdr->size)
+    C. if hdr->canary != HEAD_CANARY:
+         → HEAD CANARY CORRUPT! Something wrote into the header,
+           or the pointer is garbage.
+         → print backtrace, abort()
+
+    D. tail = *(uint64_t *)(ptr + hdr->size)
        if tail != TAIL_CANARY:
          → HEAP BUFFER OVERFLOW! The program wrote past its allocation
            and corrupted the tail canary.
          → print backtrace, abort()
 ```
 
-The **order matters**: we check for double-free first (A) because a freed block
-has `FREED_CANARY` in the head, which would fail check B ("head != HEAD_CANARY")
-with a confusing "head canary corrupt" message. By checking for FREED_CANARY
-explicitly first, we give the correct diagnosis.
+The **order matters**: we check for double-free first (A) because on `free()`,
+we store the return address in `hdr->underflow` (step 7), overwriting the
+underflow canary. If we checked underflow before double-free, a second free
+would see the return address instead of UNDERFLOW_CANARY and falsely report
+"HEAP UNDERFLOW" instead of "DOUBLE-FREE".
 
-**Step 6 — poison**: After the checks pass, we fill the entire user region
+**Step 7 — free-site**: After canaries pass, we save `__builtin_return_address(0)`
+(the address of the code that called `free()`) into `hdr->underflow`. This
+reuses the underflow field (already validated) for diagnostics. If a UAF is
+later detected, the error message includes where the block was freed.
+
+**Step 8 — poison**: After the checks pass, we fill the entire user region
 (and the tail canary) with `0xFE`. This means:
 - Any subsequent READ of this memory returns `0xFEFEFEFE...` — distinctive
   pattern that screams "use-after-free" in debugger/crash dumps
 - Any subsequent WRITE changes the poison — detected by quarantine on eviction
 
-**Step 7 — mark freed**: We set `hdr->canary = FREED_CANARY` so that if
-`free()` is called again on this pointer, step 5A catches it immediately.
+**Step 9 — mark freed**: We set `hdr->canary = FREED_CANARY` so that if
+`free()` is called again on this pointer, step 6A catches it immediately.
 
-**Step 8 — quarantine**: Instead of calling `real_free(hdr)` now, we push
-the block into the quarantine ring. This delays the actual free so the poison
-stays in place longer, increasing the window to catch UAF. See the Quarantine
-section below for the full algorithm.
+**Step 10 — quarantine**: Instead of calling `real_free(hdr)` now, we push
+the block into the thread-local quarantine ring. This delays the actual free
+so the poison stays in place longer, increasing the window to catch UAF. See
+the Quarantine section below for the full algorithm.
 
 ## Algorithm: realloc()
 
@@ -331,14 +367,14 @@ realloc(ptr, size):
          memcpy(new, ptr, min(size, available))
          return new                            — can't free bootstrap, just abandon it
     4. resolve_real()
-    5. hdr = ptr - 16
+    5. hdr = ptr - 24
     6. check_canaries(hdr, ptr)                — check BEFORE resize!
     7. old_size = hdr->size
-    8. new_raw = real_realloc(hdr, 16 + size + 8)  — libc resizes the raw block
+    8. new_raw = real_realloc(hdr, 24 + size + 8)  — libc resizes the raw block
     9. if new_raw == NULL: return NULL
    10. new_hdr = (alloc_header_t *)new_raw
    11. new_hdr->size = size                    — update stored size
-   12. new_user = new_raw + 16
+   12. new_user = new_raw + 24
    13. if size > old_size:                     — if grown, junk-fill new portion
          memset(new_user + old_size, 0xAA, size - old_size)
    14. write_tail(new_user, size)              — write tail canary at new end
@@ -433,10 +469,10 @@ overflow is caught.
    → DOUBLE-FREE detected → backtrace + abort()
 ```
 
-This works as long as the block is still in quarantine (2048 most recent frees).
-If the block was evicted and recycled by libc as a new allocation with a fresh
-HEAD_CANARY, the double-free might not be caught. With 2048 slots, this covers
-a very wide window.
+This works as long as the block is still in quarantine (256 most recent frees
+per thread). If the block was evicted and recycled by libc as a new allocation
+with a fresh HEAD_CANARY, the double-free might not be caught. For multi-threaded
+targets, total capacity is 256 x N_threads.
 
 ### 3. Use-After-Free Write
 
@@ -457,21 +493,23 @@ a very wide window.
      → USE-AFTER-FREE WRITE detected → backtrace + abort()
 ```
 
-**v2: Multi-spot UAF check.** v1 only checked the first 8 bytes after the
-header. v2 checks **three spots**: first 8 bytes, middle 8 bytes (aligned to
-8-byte boundary), and last 8 bytes. This catches UAF writes at any region
-of the buffer for the cost of only 2 extra loads:
+**Multi-spot + sampled full-buffer UAF check.** On every quarantine eviction,
+3 spots are checked: first 8 bytes, middle 8 bytes (aligned to 8-byte
+boundary), and last 8 bytes. This catches UAF writes at any region of the
+buffer for the cost of only 2 extra loads.
 
-- UAF writes to the header (bytes -16 to -1): **always detected**
-- UAF writes to bytes 0-7: **always detected**
-- UAF writes near the middle: **detected** (v2 only)
-- UAF writes near the end: **detected** (v2 only)
-- UAF writes that miss all 3 spots: **not detected** (rare in practice)
+Additionally, every 64th eviction triggers a **full-buffer scan** — checking
+ALL bytes of the freed block against the poison pattern. This catches UAF
+writes that land between the 3 spot-check locations:
 
-Full-scan would be: `memcmp(user, expected_poison, size)` for every byte.
-We skip this because it would add O(N) work per eviction, which is too slow
-for a fuzzing sanitizer where millions of allocs/frees happen per second.
-The 3-spot check is a good compromise: O(1) work, catches most UAF patterns.
+- UAF writes to the header (bytes -24 to -1): **always detected**
+- UAF writes to bytes 0-7: **always detected** (spot check)
+- UAF writes near the middle: **always detected** (spot check)
+- UAF writes near the end: **always detected** (spot check)
+- UAF writes between spots: **detected 1/64 of the time** (sampled full scan)
+
+The 3-spot check runs in O(1). The full-buffer scan runs in O(N) but only
+on 1/64 of evictions — a good balance between coverage and throughput.
 
 ### 4. Use-After-Free Read (partial)
 
@@ -521,19 +559,22 @@ canary corruption.
 ```c
 #define REGISTRY_SIZE  65536          // must be power of 2
 #define REGISTRY_MASK  (REGISTRY_SIZE - 1)
-#define SCAN_INTERVAL  1024           // periodic scan every 1024 malloc+free ops
+#define SCAN_INTERVAL_MASK  1023      // bitmask: scan every 1024 ops
+#define SCAN_CHUNK          1024      // scan 1/64th of registry per trigger
 
 static void * volatile registry[REGISTRY_SIZE];
 
 static inline size_t registry_hash(void *ptr) {
-    return ((uintptr_t)ptr >> 4) & REGISTRY_MASK;
+    uintptr_t x = (uintptr_t)ptr;
+    x *= 0x9E3779B97F4A7C15ULL;      // Fibonacci / golden ratio constant
+    return (x >> 48) & REGISTRY_MASK;
 }
 ```
 
-The hash function shifts the pointer right by 4 bits (malloc returns 16-byte
-aligned pointers, so the low bits are always zero) and masks to the table size.
-This gives O(1) amortized add/remove instead of O(N) linear scan — benchmarked
-at only ~28% overhead vs the version without registry.
+The hash uses **multiply-shift (Fibonacci hashing)**: multiplying by the golden
+ratio constant spreads entries uniformly across the table, avoiding the clustering
+that a simple shift-and-mask causes with malloc's address patterns. This gives
+O(1) amortized add/remove with shorter probe chains.
 
 ### Three scan triggers
 
@@ -546,22 +587,23 @@ at only ~28% overhead vs the version without registry.
    not `fprintf`). Previous signal handlers are saved and chained to, so
    `foxit_throw_bypass.so` and other handlers still work.
 
-3. **Periodic scan** — every 1024 `malloc()`+`free()` operations, a full registry
-   scan runs. Catches overflows while the program is still running, even if the
-   corrupted buffer isn't freed for a long time.
+3. **Incremental scan** — every 1024 `malloc()`+`free()` operations, 1/64th
+   of the registry (1024 slots) is scanned. A shared cursor advances through
+   the table, achieving full coverage over 64 triggers. Catches overflows while
+   the program is still running, even if the corrupted buffer isn't freed.
 
 ### Lock-free design
 
 Same philosophy as the quarantine — no mutex, atomic CAS operations only:
 
-- **`registry_add(hdr)`**: hash pointer to get bucket, linear probe for NULL slot,
-  `__atomic_compare_exchange_n` to claim it. If full (all 65536 slots occupied),
-  silently drops — overflow will still be caught on `free()`.
-- **`registry_remove(hdr)`**: hash pointer to get bucket, linear probe for matching
-  pointer, atomic CAS to NULL.
-- **`scan_registry(is_signal)`**: walks all slots, checks head+tail canaries.
-  Uses `write(2)` in signal context, `fprintf()` otherwise. Calls `abort()` if
-  corruption found (non-signal mode only).
+- **`registry_add(hdr)`**: Fibonacci hash to get bucket, linear probe for NULL
+  slot, `__atomic_compare_exchange_n` to claim it. If full (all 65536 slots
+  occupied), silently drops — overflow will still be caught on `free()`.
+- **`registry_remove(hdr)`**: Fibonacci hash to get bucket, linear probe for
+  matching pointer, atomic CAS to NULL.
+- **`scan_registry_range(start, count)`**: walks a range of slots (1024 per
+  trigger), checks head+tail+underflow canaries. Uses `write(2)` in signal
+  context, `fprintf()` otherwise.
 
 ### Re-entrancy guard
 
@@ -571,72 +613,64 @@ atexit → scan → find corruption → abort → SIGABRT handler → scan again
 
 ---
 
-## Quarantine: The Ring Buffer Algorithm
+## Quarantine: Thread-Local Ring Buffer
 
-The quarantine is the most algorithmically interesting part. It's a fixed-size
-ring buffer that delays `real_free()` to keep freed memory poisoned longer:
+Each thread has its own private 256-slot quarantine ring that delays
+`real_free()` to keep freed memory poisoned longer. No atomics, no contention.
 
-```
- quarantine[] array (2048 slots):
+```c
+#define TL_QUARANTINE_SIZE 256
 
- ┌───┬───┬───┬───┬───┬───┬───┬───┬─────┬──────┐
- │ 0 │ 1 │ 2 │ 3 │ 4 │ 5 │ 6 │ 7 │ ... │ 2047 │
- └───┴───┴───┴───┴───┴───┴───┴───┴─────┴──────┘
-   ↑           ↑
-   │           └─ slot has a freed block from earlier
-   └─ slot is NULL (empty, never used yet)
+typedef struct {
+    void *ring[TL_QUARANTINE_SIZE];
+    size_t idx;
+} tl_quarantine_t;
+
+static __thread tl_quarantine_t tl_q = { .idx = 0 };
 ```
 
 ### Push operation (inside our free()):
 
 ```
- 1. idx = atomic_fetch_add(&q_idx, 1) % 2048
-    — atomically get a unique slot index (wraps around)
-    — each thread gets a different slot (no collision)
+ 1. slot = tl_q.idx % 256          — simple modulo, no atomic needed
+ 2. oldest = tl_q.ring[slot]       — get whatever was in this slot
+ 3. tl_q.ring[slot] = new_block    — put our freed block in
+ 4. tl_q.idx++
 
- 2. oldest = atomic_exchange(&quarantine[idx], new_block)
-    — atomically swap: put our new freed block IN, get the old one OUT
-    — if slot was empty (NULL): oldest = NULL, nothing to evict
-    — if slot had a block: oldest = that block, needs eviction
-
- 3. if oldest != NULL:
-      check_quarantined(oldest)   — verify poison is intact
-      real_free(oldest)           — finally return memory to libc
+ 5. if oldest != NULL:
+      check_quarantined(oldest)    — verify poison is intact
+      real_free(oldest)            — finally return memory to libc
 ```
 
-### Visual example:
+### check_quarantined() — multi-spot + sampled full scan:
 
 ```
- State: quarantine = [blkA, blkB, NULL, blkC, ...]
-                      ^^^^
- free(ptr_X): idx = atomic_add(q_idx) % 2048 = 0
+ check_quarantined(hdr):
+   if hdr->canary != FREED_CANARY → USE-AFTER-FREE (header corrupted)
 
-   atomic_exchange(&quarantine[0], ptr_X)
-   → returns blkA (the old occupant)
-   → quarantine[0] = ptr_X now
+   // 3-spot check (every eviction):
+   first 8 user bytes  == 0xFEFE...? → if not, USE-AFTER-FREE
+   middle 8 user bytes == 0xFEFE...? → if not, USE-AFTER-FREE
+   last 8 user bytes   == 0xFEFE...? → if not, USE-AFTER-FREE
 
- State: quarantine = [ptr_X, blkB, NULL, blkC, ...]
-
- check_quarantined(blkA):
-   blkA->canary == FREED_CANARY? ✓
-   first 8 bytes == 0xFEFE...?   ✓
- real_free(blkA)                  — finally freed
+   // Full-buffer scan (every 64th eviction):
+   if ++tl_evict_count % 64 == 0:
+     scan ALL user bytes for any non-0xFE byte → USE-AFTER-FREE
 ```
 
-### Why ring buffer size = 2048?
+### Why 256 per-thread instead of 2048 shared?
 
-- Too small (e.g., 64): blocks get evicted quickly, short UAF detection window
-- Too large (e.g., 1M): holds too much memory, could cause OOM
-- 2048 is a sweet spot: holds ~100KB-1MB depending on allocation sizes,
-  long enough window for most UAF patterns, negligible memory overhead
+| Property | Shared 2048 | Thread-local 256 |
+|---|---|---|
+| Atomics per free() | 2 (`lock xadd` + `lock xchg`) | 0 |
+| Multi-thread contention | Cache-line bouncing | None |
+| Single-thread window | 2048 frees | 256 frees |
+| Multi-thread (10 threads) | 2048 total | 2560 total (256 x 10) |
+| Speed impact | ~39% slower | Baseline |
 
-### Why not a queue (FIFO)?
-
-A proper FIFO queue would evict blocks in exact free-order (oldest first).
-Our ring buffer with `idx % 2048` is an **approximate FIFO** — blocks are
-evicted roughly in order but not exactly, because concurrent threads may
-increment `q_idx` out of order. For fuzzing, approximate FIFO is perfectly
-fine. The benefit is no linked list, no mutex, just an array + atomic counter.
+For the main use case (multi-threaded Foxit with 10 threads), the total
+quarantine capacity is actually **larger** than the shared version, while
+eliminating all atomic operations from the free path.
 
 ---
 
@@ -650,52 +684,44 @@ A mutex in malloc/free would cause:
 2. **Priority inversion**: fuzzing thread blocked waiting for SDK background thread
 3. **Deadlock risk**: if a signal handler fires while holding the mutex
 
-Instead, we use two atomic operations:
+### Thread-local quarantine: zero atomics
 
-### 1. `__sync_fetch_and_add(&q_idx, 1)` — Atomic increment
+The quarantine is entirely thread-local (`__thread` storage). Each thread's
+`free()` writes only to its own 256-slot ring — no shared state, no atomics,
+no contention. This is the biggest performance win over earlier versions.
 
-This is a single CPU instruction (`lock xadd` on x86). It atomically reads the
-current value of `q_idx`, adds 1, and returns the old value. Even if 10 threads
-call this simultaneously, each gets a **unique** number. No two threads ever get
-the same slot index.
+### Registry: lock-free atomic CAS
 
-```
- Thread A: __sync_fetch_and_add(&q_idx, 1) → gets 500
- Thread B: __sync_fetch_and_add(&q_idx, 1) → gets 501  (or vice versa)
- Never: both get 500
-```
+The allocation registry IS shared across threads (it needs to track all live
+allocations for signal-handler and exit scans). It uses atomic CAS operations:
 
-### 2. `__atomic_exchange_n(&quarantine[idx], new_block, __ATOMIC_RELAXED)` — Atomic swap
-
-This atomically replaces the value in `quarantine[idx]` with `new_block` and
-returns whatever was there before. Even if two threads somehow get the same
-`idx` (can't happen with our design, but hypothetically), the exchange is atomic:
-one thread gets the old value, the other gets the first thread's value. No data
-is lost or corrupted.
-
-`__ATOMIC_RELAXED` means we don't need memory ordering guarantees between threads.
-We don't care if thread B sees thread A's write immediately — quarantine eviction
-checks are probabilistic anyway (we only check on eviction, not on every access).
+- **`registry_add(hdr)`**: hash pointer with Fibonacci hash, linear probe for
+  NULL slot, `__atomic_compare_exchange_n` to claim it.
+- **`registry_remove(hdr)`**: hash pointer, linear probe for matching entry,
+  atomic CAS to NULL.
+- **`scan_registry_range(start, count)`**: walks a range of slots, checks
+  canaries. Uses `write(2)` in signal context, `fprintf()` otherwise.
 
 ### Why this is safe:
 
-- Unique index per free() → no two threads write to same slot simultaneously
-- Atomic exchange → even if same slot, swap is atomic (no torn read/write)
-- No shared mutable state beyond the quarantine array itself
+- Quarantine: entirely thread-local, no sharing at all
+- Registry: atomic CAS ensures no torn reads/writes on pointer slots
 - No ABA problem: we don't make decisions based on "was this value changed?"
-- Worst case under extreme contention: a block gets evicted slightly sooner
-  or later than ideal — acceptable for a fuzzing sanitizer
+- Worst case under extreme contention: a registry slot is briefly occupied
+  by two threads probing — one will find the next empty slot
 
 ---
 
 ## Magic Values: Why These Specific Numbers
 
 ```c
-#define HEAD_CANARY  0xDEADBEEFCAFEBABEULL    // live allocation
-#define TAIL_CANARY  0xFEEDFACE8BADF00DULL    // end of allocation
-#define FREED_CANARY 0xFEFEFEFEFEFEFEFEULL   // freed allocation
-#define POISON_BYTE  0xFE                      // fill freed memory
-#define JUNK_BYTE    0xAA                      // fill new allocations
+#define HEAD_CANARY       0xDEADBEEFCAFEBABEULL   // live allocation
+#define TAIL_CANARY       0xFEEDFACE8BADF00DULL   // end of allocation
+#define FREED_CANARY      0xFEFEFEFEFEFEFEFEULL  // freed allocation
+#define UNDERFLOW_CANARY  0xBADC0FFEE0DDF00DULL   // red zone before header
+#define GUARD_UNDERFLOW   0xBADC0FFEE0DD6ACEULL   // marks guard-page allocs
+#define POISON_BYTE       0xFE                     // fill freed memory
+#define JUNK_BYTE         0xAA                     // fill new allocations
 ```
 
 **HEAD_CANARY (0xDEADBEEFCAFEBABE)**:
@@ -731,6 +757,16 @@ checks are probabilistic anyway (we only check on eviction, not on every access)
 - As a character: not printable ASCII, stands out in string dumps
 - Different from POISON (0xFE) so you can distinguish "never written" from
   "freed" in crash dumps
+
+**UNDERFLOW_CANARY (0xBADC0FFEE0DDF00D)**:
+- Placed before the header as a red zone for heap underflow detection
+- Different from HEAD, TAIL, and FREED so it's never confused with other states
+- Checked on every `free()` and `realloc()` before any other canary checks
+
+**GUARD_UNDERFLOW (0xBADC0FFEE0DD6ACE)**:
+- Marks allocations that used the guard-page code path (>= 64KB)
+- `is_guard_page_alloc()` checks for this marker to route to `munmap`-based free
+- Accepted as valid alongside UNDERFLOW_CANARY in canary checks
 
 ---
 
@@ -849,7 +885,7 @@ The harness sets `phase = 0` before parsing and `phase = 1` before cleanup.
 | UAF writes                | **Yes** (quarantine)   | No                     | **Yes**                 |
 | UAF reads                 | Partial (poison)       | No                     | **Yes** (immediate)     |
 | Uninit reads              | Partial (junk fill)    | No                     | MSan (separate tool)    |
-| Memory overhead           | ~24 bytes/alloc + quarantine | 1 page/alloc    | 1/8 of address space    |
+| Memory overhead           | ~32 bytes/alloc + quarantine | 1 page/alloc    | 1/8 of address space    |
 | False positives           | None                   | OOM in persistent mode | None                    |
 
 **Key insight**: ASan is the gold standard but requires source code and
@@ -868,10 +904,10 @@ dramatically lower overhead than libdislocator.
    (jumping over the 8-byte tail canary) into the next allocation's header, we
    miss it. In practice this is rare — overflows are almost always sequential.
 
-2. **UAF writes that miss all 3 check spots**: v2 checks first/middle/last
-   8 bytes (3 spots), which catches most UAF patterns. But a UAF write that
-   lands between the spots (e.g., exactly at byte 20 of a 256-byte buffer)
-   won't be caught. Full-scan would fix this but costs O(N) per eviction.
+2. **UAF writes that miss all checks**: The 3-spot check (first/middle/last
+   8 bytes) catches most UAF patterns. The sampled full-buffer scan (every
+   64th eviction) provides additional coverage. But a UAF write between spots
+   that gets evicted on a non-scan eviction (63/64 chance) is missed.
 
 3. **UAF reads**: No active detection. Poison (0xFE) passively causes downstream
    failures but doesn't immediately abort. Hardware watchpoints or shadow memory
@@ -882,9 +918,10 @@ dramatically lower overhead than libdislocator.
 
 5. **Global buffer overflow**: Same — global/static arrays don't go through malloc.
 
-6. **Heap underflow (writing before the allocation)**: We check the head canary,
-   but only on free()/realloc(). An underflow that doesn't reach the head canary
-   (e.g., writes to a neighboring allocation before ours) won't be caught.
+6. **Heap underflow beyond the red zone**: We have an 8-byte underflow canary
+   before the header. Writes that land in those 8 bytes are caught. But an
+   underflow that writes to a different allocation before ours (not into our
+   red zone) won't be caught by the underflow check.
 
 ### Thread safety caveats
 
@@ -900,16 +937,17 @@ tail IS a real bug), but the backtrace might not show the exact corrupting threa
    with more than 65536 simultaneous live allocations will have some untracked —
    overflows on those are only caught on `free()`, not by registry scans.
 
-8. **Periodic scan overhead**: Every 1024 malloc/free operations, a full registry
-   scan walks all 65536 slots. Add/remove are O(1) amortized (hash table with
-   linear probing). Benchmarked at ~28% overhead vs the version without registry
-   on a 500K-operation mixed workload (0.19s vs 0.15s).
+8. **Incremental scan coverage cycle**: Every 1024 malloc/free operations, 1/64th
+   of the registry (1024 slots) is scanned. Full coverage takes 64 triggers
+   (65,536 ops). An overflow on a never-freed buffer could sit undetected for
+   up to 64 scan cycles before the cursor reaches its slot.
 
 ### Memory overhead
 
-- Per allocation: 24 bytes extra (16-byte header + 8-byte tail canary)
-- Quarantine: up to 2048 freed blocks held in memory
+- Per allocation: 32 bytes extra (24-byte header + 8-byte tail canary)
+- Quarantine: up to 256 freed blocks per thread held in memory
 - Registry: 65536 pointer slots (512KB static array)
+- Guard pages: 2 extra 4KB pages per allocation >= 64KB
 - For Foxit SDK: negligible compared to the library's own memory usage (~200MB+)
 
 ---
@@ -919,16 +957,24 @@ tail IS a real bug), but the backtrace might not show the exact corrupting threa
 ### Build
 
 ```bash
-cd /home/dvirgo/foxit_fuzz/custom_sanitizer
-gcc -shared -fPIC -O2 -o canary_sanitizer.so canary_sanitizer.c -ldl -rdynamic
+cd /home/dvirgo/custom_sanitizer
+gcc -shared -fPIC -O3 -o canary_sanitizer.so canary_sanitizer.c -ldl -rdynamic
 ```
 
 Flags:
 - `-shared -fPIC`: build as position-independent shared library
-- `-O2`: optimize (faster checks, important for fuzzing throughput)
+- `-O3`: aggressive optimization (auto-vectorization, inlining — important for
+  fuzzing throughput)
 - `-ldl`: link libdl for `dlsym()` (resolving real libc functions)
 - `-rdynamic`: export symbols from the executable so `backtrace_symbols_fd()`
   can resolve function names in the backtrace output
+
+### Run tests
+
+```bash
+bash tests/run_tests.sh          # 48 tests
+bash tests/run_bench.sh          # Benchmark: baseline vs sanitizer
+```
 
 ### Standalone test (single PDF)
 ```bash
@@ -967,29 +1013,21 @@ The canary sanitizer is a pure LD_PRELOAD shim. It works with the existing
 
 ```
 custom_sanitizer/
-├── canary_sanitizer.c        — v2 source (~585 lines)
-├── canary_sanitizer.so       — v2 compiled library
+├── canary_sanitizer.c        — Source (~700 lines)
+├── canary_sanitizer.so       — Compiled library (-O3)
 ├── README.md                 — This file
 ├── .gitignore
-├── tests/                    — v2 test suite (42 tests)
-│   ├── run_tests.sh
-│   ├── run_bench.sh
-│   ├── bench_speed.c
-│   └── test_*.c              — 42 test files
-└── canary_sanitizer_v3/      — v3 maximum speed variant
-    ├── canary_sanitizer.c    — v3 source (~700 lines)
-    ├── canary_sanitizer.so   — v3 compiled library (-O3)
-    └── tests/                — v3 test suite (48 tests)
-        ├── run_tests.sh      — Full test harness
-        ├── run_bench.sh      — Benchmark: baseline vs v2 vs v3
-        ├── run_comparison.sh — Detection comparison: v2 vs v3
-        ├── bench_speed.c     — Throughput benchmark
-        └── test_*.c          — 48 test files (42 from v2 + 6 new)
+└── tests/                    — Test suite (48 tests)
+    ├── run_tests.sh          — Full test harness
+    ├── run_bench.sh          — Benchmark: baseline vs sanitizer
+    ├── bench_speed.c         — Throughput benchmark (500K ops)
+    ├── bench_guard_page.c    — Guard page overhead benchmark
+    └── test_*.c              — 48 test files
 ```
 
 ## Tested Detections
 
-All verified with 42 automated tests (`tests/run_tests.sh`):
+All verified with 48 automated tests (`tests/run_tests.sh`):
 
 | Test                         | Result    | Details                                     |
 |------------------------------|-----------|---------------------------------------------|
@@ -1004,230 +1042,86 @@ All verified with 42 automated tests (`tests/run_tests.sh`):
 | Overflow on calloc'd buf     | DETECTED  | exit 134 (SIGABRT), backtrace printed       |
 | Overflow on large alloc      | DETECTED  | exit 134 (SIGABRT), backtrace printed       |
 | Overflow on zero-size alloc  | DETECTED  | exit 134 (SIGABRT), backtrace printed       |
-| Double-free                  | DETECTED  | exit 134 (SIGABRT), backtrace printed       |
-| Double-free (immediate)      | DETECTED  | exit 134 (SIGABRT), backtrace printed       |
-| Double-free (with ops)       | DETECTED  | exit 134 (SIGABRT), backtrace printed       |
+| Double-free                  | DETECTED  | exit 134, includes free-site address        |
+| Double-free (immediate)      | DETECTED  | exit 134, includes free-site address        |
+| Double-free (with ops)       | DETECTED  | exit 134, includes free-site address        |
 | UAF write (first 8 bytes)    | DETECTED  | quarantine eviction catches corruption      |
 | UAF write (header)           | DETECTED  | quarantine eviction catches corruption      |
 | UAF write (delayed)          | DETECTED  | quarantine eviction catches corruption      |
-| UAF write (middle) [v2]      | DETECTED  | multi-spot check catches middle corruption  |
-| UAF write (end) [v2]         | DETECTED  | multi-spot check catches end corruption     |
+| UAF write (middle)           | DETECTED  | multi-spot check catches middle corruption  |
+| UAF write (end)              | DETECTED  | multi-spot check catches end corruption     |
+| UAF write (between spots)    | DETECTED  | sampled full-buffer scan catches it         |
 | UAF read                     | PARTIAL   | `0xFEFEFEFE` poison visible in memory      |
+| Heap underflow (direct)      | DETECTED  | underflow canary corrupted → abort          |
+| Heap underflow (memcpy)      | DETECTED  | underflow canary corrupted → abort          |
+| Guard page basic (no crash)  | CLEAN     | 64KB/100KB allocs work without false pos    |
+| Guard page overflow           | DETECTED  | SIGSEGV from hardware guard page            |
+| Free-site in error msg       | DETECTED  | UAF error includes free-site address        |
 | Junk fill                    | WORKING   | `0xAAAAAAAA` in new allocations             |
 | calloc zeroed                | WORKING   | calloc memory correctly zero-initialized    |
-| calloc integer overflow [v2] | WORKING   | returns NULL on nmemb*size wraparound       |
-| memalign basic [v2]          | CLEAN     | intercepted, allocation works correctly     |
-| memalign overflow [v2]       | DETECTED  | overflow caught after memalign              |
-| posix_memalign basic [v2]    | CLEAN     | intercepted, allocation works correctly     |
-| posix_memalign overflow [v2] | DETECTED  | overflow caught after posix_memalign        |
-| aligned_alloc basic [v2]     | CLEAN     | intercepted, allocation works correctly     |
-| aligned_alloc overflow [v2]  | DETECTED  | overflow caught after aligned_alloc         |
+| calloc integer overflow      | WORKING   | returns NULL on nmemb*size wraparound       |
+| memalign basic               | CLEAN     | intercepted, allocation works correctly     |
+| memalign overflow            | DETECTED  | overflow caught after memalign              |
+| posix_memalign basic         | CLEAN     | intercepted, allocation works correctly     |
+| posix_memalign overflow      | DETECTED  | overflow caught after posix_memalign        |
+| aligned_alloc basic          | CLEAN     | intercepted, allocation works correctly     |
+| aligned_alloc overflow       | DETECTED  | overflow caught after aligned_alloc         |
 | Normal usage                 | CLEAN     | exit 0, no false positives                  |
 | Heavy normal usage           | CLEAN     | 10K+ operations, no false positives         |
 | Quarantine stress            | CLEAN     | 50K frees, quarantine cycles correctly      |
-| Speed                        | ~1.03x    | ~3% overhead on 500K operation benchmark    |
+| Mixed alloc types            | CLEAN     | all allocator variants, no false positives  |
 
 ---
 
-## v3: Maximum Speed Variant
+## Honest Trade-offs
 
-`canary_sanitizer_v3/` is a separate version optimized for maximum speed while adding
-new detection capabilities. It is **not** a replacement for v2 — each has trade-offs
-that make it better suited for different targets.
+### 1. Shorter UAF detection window (single-threaded)
 
-### v3 Speed Improvements (6 changes)
+The thread-local quarantine has 256 slots per thread. A freed block stays
+poisoned for up to 256 more frees on that thread. For single-threaded targets,
+this is a shorter window than a shared 2048-slot quarantine would provide.
 
-**1. Thread-local quarantine (biggest win)**
+For multi-threaded targets (e.g., Foxit with 10 threads), total capacity is
+256 x 10 = 2560 slots — comparable to or better than a shared approach.
 
-v2 uses a single shared 2048-slot quarantine ring with 2 atomic CPU instructions
-(`lock xadd` + `lock xchg`) on every `free()`. These atomics cause cache-line
-bouncing between CPU cores in multi-threaded programs.
+### 2. Bigger header (24 bytes vs 16 bytes)
 
-v3 gives each thread its own private 256-slot quarantine ring using `__thread`
-storage. Free becomes pure local memory operations — zero atomics, zero contention.
+Every allocation uses 32 bytes of overhead (24-byte header + 8-byte tail).
+For programs that do millions of tiny `malloc(8)` calls, this means 4x the
+requested size per allocation.
 
-**2. Incremental registry scan**
-
-v2 scans all 65,536 registry slots every 1024 operations — O(65536) work per trigger.
-v3 scans only 1/64th (1024 slots) per trigger using a shared cursor that advances
-through the table. Same full coverage over time, 64x less work per trigger.
-
-**3. Multiply-shift hash (Fibonacci hashing)**
-
-v2: `(ptr >> 4) & mask` — simple shift, clusters entries because malloc returns
-addresses with patterns in the upper bits. Causes long linear probe chains.
-
-v3: `(ptr * 0x9E3779B97F4A7C15) >> 48 & mask` — multiplication by the golden
-ratio constant spreads entries uniformly. Fewer probes = faster add/remove.
-
-**4. Inline small memset**
-
-For allocations <= 64 bytes (the majority), v3 does junk fill inline with
-unrolled 8-byte writes instead of calling `memset()`. Avoids function call
-overhead for the common case.
-
-**5. -O3 build (vs -O2)**
-
-More aggressive compiler optimizations including auto-vectorization and
-function inlining.
-
-**6. Bitmask for scan interval**
-
-v2: `counter % 1024` — requires a division instruction.
-v3: `counter & 1023` — single AND instruction. Same result since 1024 is power of 2.
-
-### v3 New Detection (4 features)
-
-**7. Heap underflow red zone**
-
-v3 adds an 8-byte underflow canary (`0xBADC0FFEE0DDF00D`) BEFORE the header:
-
-```
- v2 layout (16-byte header):
- [size(8)][canary(8)][user data...][tail(8)]
-
- v3 layout (24-byte header):
- [underflow(8)][size(8)][canary(8)][user data...][tail(8)]
-```
-
-If something writes backward past the start of an allocation (heap underflow),
-the underflow canary gets corrupted → detected on `free()` or `realloc()`.
-
-**8. Sampled full-buffer poison check**
-
-Every 64th quarantine eviction, v3 scans ALL bytes of the freed block instead
-of just the 3 spot-check locations. This catches UAF writes that land between
-the first/middle/last spots. Cost: O(N) work on 1/64 of evictions, O(1) on
-the other 63/64.
-
-**9. Free-site diagnostic**
-
-When `free()` is called, v3 saves `__builtin_return_address(0)` (the caller's
-address) in the header's underflow field (which was already verified). If a UAF
-is later detected, the error message includes where the block was freed:
-
-```
-*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***
-    ptr=0x55f8a0 size=64 (freed data corrupted at offset 0)
-    free-site: 0x401234
-```
-
-**10. Guard pages for huge allocations (>= 64KB)**
-
-Allocations >= 64KB use `mmap` with `PROT_NONE` guard pages before and after:
-
-```
- [PROT_NONE guard(4K)][header(24)][user data(N)][tail(8)][PROT_NONE guard(4K)]
-```
-
-Any overflow or underflow on a huge buffer triggers an instant SIGSEGV from the
-CPU hardware — no need to wait for `free()` to check canaries.
-
-### v3 Benchmark Results
-
-500K-operation mixed workload (ops/sec, higher = better):
-
-```
-                          Baseline       v2            v3          v3 vs v2
-malloc/free mix:      20,297,537    6,752,920     9,223,537      +37% faster
-pure malloc+free:     27,277,001    4,701,576     6,549,295      +39% faster
-calloc+free:          37,753,643   18,681,834    35,540,841      +90% faster
-large alloc (4K-64K): 10,655,240      289,634       834,309     +188% faster
-realloc chains:        6,852,165    2,248,330     3,616,578      +61% faster
-```
-
-### v3 Detection Comparison (what v3 catches that v2 misses)
-
-```
-Test                       v2        v3
-─────────────────────────  ────────  ────────
-Heap underflow (direct)    MISSED    CAUGHT
-Heap underflow (memcpy)    MISSED    CAUGHT
-UAF write (between spots)  MISSED    CAUGHT   (sampled full-buffer scan)
-Guard page overflow (64K+) CAUGHT    CAUGHT
-All v2 detections          CAUGHT    CAUGHT   (no regressions)
-```
-
-### v3 Honest Trade-offs
-
-**1. Shorter UAF detection window (single-threaded)**
-
-v2 quarantine: 2048 shared slots. A freed block stays poisoned for up to 2048
-more frees. v3 quarantine: 256 per-thread slots. A freed block stays poisoned
-for only 256 more frees. A UAF write that happens between 256-2048 frees after
-the original free — v2 catches it, v3 doesn't.
-
-For multi-threaded targets (e.g., Foxit with 10 threads), total v3 capacity is
-256 x 10 = 2560, which is larger than v2's 2048. But for single-threaded
-fuzz harnesses, the window is 8x shorter.
-
-**2. Bigger header (24 bytes vs 16 bytes)**
-
-Every allocation costs 8 extra bytes for the underflow canary. Per-allocation
-overhead goes from 24 bytes (v2: 16 header + 8 tail) to 32 bytes (v3: 24
-header + 8 tail). For a program that does millions of tiny `malloc(8)` calls,
-this means 4x the requested size per allocation instead of 3x.
-
-**3. Guard page allocs are slower than regular malloc**
+### 3. Guard page allocs are slower than regular malloc
 
 Allocations >= 64KB use mmap + 2x mprotect + munmap (4 syscalls per alloc/free
-cycle). Measured overhead:
+cycle). Benchmarked:
 
 ```
-malloc(65536) + free:   v2 = 85,970 ops/sec    v3 = 42,919 ops/sec  (v3 is 2x slower)
-malloc(128KB) + free:   v2 = 33,853 ops/sec    v3 = 21,136 ops/sec  (v3 is 1.6x slower)
-malloc(65535) + free:   v2 = 175,718 ops/sec   v3 = 262,936 ops/sec (v3 is 1.5x faster)
+malloc(65536) + free:   ~42,919 ops/sec  (regular malloc: ~86K ops/sec = 2x slower)
+malloc(128KB) + free:   ~21,136 ops/sec  (regular malloc: ~34K ops/sec = 1.6x slower)
+malloc(65535) + free:   ~262,936 ops/sec (just below threshold, regular path)
 ```
 
 The 65535 vs 65536 boundary is sharp: 1 byte difference = completely different
 code path. If a target does lots of 64KB+ allocations (image buffers,
-decompression buffers), v3 will be slower than v2 for those allocations.
+decompression buffers), those specific allocations will be slower.
 
-**4. Guard page allocs skip quarantine**
+### 4. Guard page allocs skip quarantine
 
 Huge allocs are `munmap`'d immediately on free — no quarantine delay. This means
 UAF writes to huge freed buffers cannot be detected by quarantine eviction checks.
-The guard page catches overflow/underflow instantly, but UAF detection for huge
-buffers is weaker than v2.
+The guard page catches overflow/underflow instantly via hardware SIGSEGV, but UAF
+detection for huge buffers relies on the registry scan only.
 
-**5. Sampled full-buffer scan is probabilistic**
+### 5. Sampled full-buffer scan is probabilistic
 
 The full-buffer scan runs every 64th eviction. If a UAF write lands between the
 3 spot-check locations AND the block gets evicted on a non-scan eviction (63/64
-chance), it's missed. v2 never catches these at all, so v3 is strictly better,
-but it's not 100% coverage.
+chance), it's missed. This is strictly better than no full-buffer scan, but it's
+not 100% coverage.
 
-**6. Incremental registry scan has longer coverage cycle**
+### 6. Incremental registry scan has longer coverage cycle
 
-v2 scans all 65,536 slots every 1024 ops — guaranteed full coverage. v3 scans
-1/64th per trigger, taking 64 triggers (65,536 ops) to cover the full registry.
-An overflow on a never-freed buffer could sit undetected 64x longer before the
-scan reaches its slot.
-
-### When to use v2 vs v3
-
-| Scenario | Best choice | Why |
-|---|---|---|
-| Single-threaded target, lots of UAF bugs | **v2** | 2048-slot quarantine catches delayed UAF |
-| Target allocates many 64KB+ buffers | **v2** | No mmap/munmap overhead |
-| Multi-threaded target (Foxit, Chrome, etc.) | **v3** | Thread-local quarantine = no atomic contention |
-| Target uses mostly small allocations (< 64KB) | **v3** | 37-90% faster across the board |
-| Need heap underflow detection | **v3** | v2 has no underflow canary |
-| Need free-site in error messages | **v3** | v2 doesn't store free-site |
-| Memory-tight target, every byte counts | **v2** | 8 fewer bytes per allocation |
-
-### v3 Build
-
-```bash
-cd canary_sanitizer_v3
-gcc -shared -fPIC -O3 -o canary_sanitizer.so canary_sanitizer.c -ldl -rdynamic
-```
-
-### v3 Test Suite
-
-```bash
-cd canary_sanitizer_v3
-bash tests/run_tests.sh          # 48 tests (42 from v2 + 6 new)
-bash tests/run_bench.sh          # Benchmark: baseline vs v2 vs v3
-bash tests/run_comparison.sh     # Detection comparison: v2 vs v3
-```
+The registry scans 1/64th (1024 slots) per trigger, taking 64 triggers
+(65,536 total ops) to cover the full 65,536-slot table. An overflow on a
+never-freed buffer could sit undetected for up to 64 scan cycles before the
+cursor reaches its slot.
