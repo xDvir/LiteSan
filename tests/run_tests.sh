@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run_tests.sh — Comprehensive test suite for canary_sanitizer
+# run_tests.sh — Comprehensive test suite for litesan
 #
 # Builds all tests, runs them with the sanitizer, checks results.
 # Tests are either CRASH (expected abort, exit 134) or CLEAN (expected exit 0).
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SANITIZER="$SCRIPT_DIR/../canary_sanitizer.so"
+SANITIZER="$SCRIPT_DIR/../litesan.so"
 BUILD_DIR="$SCRIPT_DIR/build"
 
 # Colors
@@ -27,7 +27,7 @@ mkdir -p "$BUILD_DIR"
 # Check sanitizer exists
 if [ ! -f "$SANITIZER" ]; then
     echo -e "${RED}ERROR: $SANITIZER not found. Build it first:${RST}"
-    echo "  gcc -shared -fPIC -O2 -o canary_sanitizer.so canary_sanitizer.c -ldl -rdynamic"
+    echo "  gcc -shared -fPIC -O2 -o litesan.so litesan.c -ldl -rdynamic"
     exit 1
 fi
 
@@ -64,7 +64,7 @@ run_test() {
     if [ "$expect" = "CRASH" ]; then
         if [ "$exit_code" -eq 134 ]; then
             # Verify it's our sanitizer, not a random crash
-            if grep -q "CANARY_SANITIZER" "$stderr_file"; then
+            if grep -q "LITESAN" "$stderr_file"; then
                 result="PASS"
                 # Check for specific message if requested
                 if [ -n "$check_msg" ]; then
@@ -99,7 +99,7 @@ run_test() {
             result="FAIL"
             detail="(expected exit 0, got $exit_code)"
             # Show sanitizer output for debugging
-            if grep -q "CANARY_SANITIZER" "$stderr_file"; then
+            if grep -q "LITESAN" "$stderr_file"; then
                 detail="$detail — FALSE POSITIVE"
             fi
         fi
@@ -120,7 +120,7 @@ run_test() {
 
 echo ""
 echo -e "${CYN}╔══════════════════════════════════════════════════════════════╗${RST}"
-echo -e "${CYN}║          Canary Sanitizer — Test Suite                      ║${RST}"
+echo -e "${CYN}║          LiteSan — Test Suite                      ║${RST}"
 echo -e "${CYN}╚══════════════════════════════════════════════════════════════╝${RST}"
 echo ""
 

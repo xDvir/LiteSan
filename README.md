@@ -1,4 +1,4 @@
-# Canary Sanitizer — Lightweight Heap Sanitizer for Persistent Mode Fuzzing
+# LiteSan — Lightweight Heap Sanitizer for Persistent Mode Fuzzing
 
 ## Table of Contents
 
@@ -18,7 +18,7 @@
 14. [Magic Values: Why These Specific Numbers](#magic-values-why-these-specific-numbers)
 15. [Edge Cases Handled](#edge-cases-handled)
 16. [Signal Chain: From Detection to AFL](#signal-chain-from-detection-to-afl)
-17. [Comparison: canary_sanitizer vs libdislocator vs ASan](#comparison)
+17. [Comparison: LiteSan vs libdislocator vs ASan](#comparison)
 18. [Limitations and Trade-offs](#limitations-and-trade-offs)
 19. [Build and Usage](#build-and-usage)
 20. [Files](#files)
@@ -56,7 +56,7 @@ never actually started fuzzing.
 
 ## Solution Overview
 
-`canary_sanitizer.so` takes a completely different approach:
+`litesan.so` takes a completely different approach:
 
 - Uses **normal libc malloc** internally (no mmap per alloc)
 - Wraps each allocation with **canary sentinel values** (magic numbers)
@@ -130,7 +130,7 @@ static void resolve_real(void) {
 
 // v2: resolve once at library load
 __attribute__((constructor))
-static void canary_sanitizer_init(void) {
+static void litesan_init(void) {
     resolve_real();
     atexit(atexit_scan);
     // install signal handlers ...
@@ -545,7 +545,7 @@ visible failures downstream.
 
 ## Allocation Registry: Exit, Signal, and Periodic Scanning
 
-The original canary sanitizer only checks for overflows at `free()` / `realloc()`
+The original LiteSan only checks for overflows at `free()` / `realloc()`
 time. If a buffer is overflowed but never freed (memory leak), the overflow is
 completely invisible. The **allocation registry** closes this gap.
 
@@ -821,11 +821,11 @@ overflow that might not corrupt our tail canary (the write could skip past it).
 
 ## Signal Chain: From Detection to AFL
 
-When the canary sanitizer detects corruption, it calls `abort()` which sends
+When LiteSan detects corruption, it calls `abort()` which sends
 SIGABRT to the process. Here's the full chain of signal handlers:
 
 ```
-canary_sanitizer.so: check_canaries() fails
+litesan.so: check_canaries() fails
   │
   ▼
 abort()  →  raises SIGABRT
@@ -851,12 +851,12 @@ harness crash_handler (installed by harness_foxit_persist.cpp)
       └─ _exit(0) — suppress, cleanup crashes aren't interesting
 ```
 
-**Why the mmap probe?** When running with libdislocator (not our canary sanitizer),
+**Why the mmap probe?** When running with libdislocator (not LiteSan),
 libdislocator itself calls `abort()` when it can't mmap. The bypass handler's
 mmap probe distinguishes "ran out of address space" (OOM → suppress) from
 "canary corruption detected" (real bug → report to AFL).
 
-With our canary sanitizer, the mmap probe always succeeds (we don't exhaust
+With LiteSan, the mmap probe always succeeds (we don't exhaust
 address space), so canary detections always flow through as real crashes to AFL.
 
 **Why phase-based handling?** Foxit SDK can crash during cleanup
@@ -868,9 +868,9 @@ The harness sets `phase = 0` before parsing and `phase = 1` before cleanup.
 
 ## Comparison
 
-### canary_sanitizer vs libdislocator vs AddressSanitizer (ASan)
+### LiteSan vs libdislocator vs AddressSanitizer (ASan)
 
-| Property                  | canary_sanitizer       | libdislocator          | ASan (compile-time)     |
+| Property                  | LiteSan                | libdislocator          | ASan (compile-time)     |
 |---------------------------|------------------------|------------------------|-------------------------|
 | Instrumentation           | LD_PRELOAD (binary)    | LD_PRELOAD (binary)    | Compile-time (source)   |
 | Works on closed-source    | **Yes**                | **Yes**                | No (need source)        |
@@ -891,7 +891,7 @@ The harness sets `phase = 0` before parsing and `phase = 1` before cleanup.
 **Key insight**: ASan is the gold standard but requires source code and
 compile-time instrumentation. For a closed-source library like Foxit's
 `libfsdk_linux64.so`, we can only use LD_PRELOAD approaches. Among those,
-canary_sanitizer gives us most of ASan's detection capabilities with
+LiteSan gives us most of ASan's detection capabilities with
 dramatically lower overhead than libdislocator.
 
 ---
@@ -958,7 +958,7 @@ tail IS a real bug), but the backtrace might not show the exact corrupting threa
 
 ```bash
 cd /home/dvirgo/custom_sanitizer
-gcc -shared -fPIC -O3 -o canary_sanitizer.so canary_sanitizer.c -ldl -rdynamic
+gcc -shared -fPIC -O3 -o litesan.so litesan.c -ldl -rdynamic
 ```
 
 Flags:
@@ -978,7 +978,7 @@ bash tests/run_bench.sh          # Benchmark: baseline vs sanitizer
 
 ### Standalone test (single PDF)
 ```bash
-LD_PRELOAD=./foxit_throw_bypass.so:./custom_sanitizer/canary_sanitizer.so \
+LD_PRELOAD=./foxit_throw_bypass.so:./custom_sanitizer/litesan.so \
   ./harness_foxit_persist test.pdf
 ```
 
@@ -996,7 +996,7 @@ LD_PRELOAD=./foxit_throw_bypass.so:./custom_sanitizer/canary_sanitizer.so \
 
 ### AFL_PRELOAD order
 ```
-AFL_PRELOAD=foxit_throw_bypass.so:canary_sanitizer.so
+AFL_PRELOAD=foxit_throw_bypass.so:litesan.so
 ```
 
 The bypass .so MUST come first — it installs signal handlers that the canary
@@ -1004,7 +1004,7 @@ sanitizer's `abort()` calls flow through.
 
 ### No harness changes needed
 
-The canary sanitizer is a pure LD_PRELOAD shim. It works with the existing
+LiteSan is a pure LD_PRELOAD shim. It works with the existing
 `harness_foxit_persist` binary without any modifications.
 
 ---
@@ -1013,8 +1013,8 @@ The canary sanitizer is a pure LD_PRELOAD shim. It works with the existing
 
 ```
 custom_sanitizer/
-├── canary_sanitizer.c        — Source (~700 lines)
-├── canary_sanitizer.so       — Compiled library (-O3)
+├── litesan.c                 — Source (~700 lines)
+├── litesan.so                — Compiled library (-O3)
 ├── README.md                 — This file
 ├── .gitignore
 └── tests/                    — Test suite (48 tests)

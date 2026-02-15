@@ -1,26 +1,26 @@
 /*
- * canary_sanitizer.so v3 — Maximum speed heap sanitizer for persistent mode fuzzing
+ * litesan.so — Lightweight heap sanitizer for persistent mode fuzzing
  *
  * LD_PRELOAD shim: overrides malloc/free/calloc/realloc/memalign/posix_memalign/
  * aligned_alloc with canary-guarded versions.
  *
- * v3 improvements over v2:
+ * Features:
  *   Speed:
  *   1. Multiply-shift registry hash (better distribution, fewer probes)
  *   2. Thread-local quarantine (eliminates 2 atomics from free hot path)
  *   3. Incremental registry scan (1/64th per trigger, not all 65536 slots)
  *   4. Inline small memset for tiny allocations (<= 64 bytes)
- *   5. Build with -O3 (vs -O2)
+ *   5. Build with -O3
  *   6. Bitmask for scan interval check (& instead of %)
  *
- *   New detection (zero/near-zero cost):
+ *   Detection (zero/near-zero cost):
  *   7. Free-site stored in header on free (reuses size field for diagnostics)
  *   8. Sampled full-buffer poison check (1-in-64 full scan on eviction)
  *   9. Heap underflow detection (8-byte pre-header red zone)
  *   10. Guard page for huge allocations (>= 64KB, mmap+mprotect)
  *
  * Build:
- *   gcc -shared -fPIC -O3 -o canary_sanitizer.so canary_sanitizer.c -ldl -rdynamic
+ *   gcc -shared -fPIC -O3 -o litesan.so litesan.c -ldl -rdynamic
  */
 
 #define _GNU_SOURCE
@@ -181,7 +181,7 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
      * underflow first would give a misleading "HEAP UNDERFLOW" error. */
     if (__builtin_expect(hdr->canary == FREED_CANARY, 0)) {
         fprintf(stderr,
-            "\n*** CANARY_SANITIZER: DOUBLE-FREE in %s() ptr=%p ***\n", fn, user);
+            "\n*** LITESAN: DOUBLE-FREE in %s() ptr=%p ***\n", fn, user);
         /* v3: show free-site if stored */
         if (hdr->underflow != UNDERFLOW_CANARY && hdr->underflow != GUARD_UNDERFLOW
             && hdr->underflow != 0) {
@@ -194,7 +194,7 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
     if (__builtin_expect(hdr->underflow != UNDERFLOW_CANARY &&
                          hdr->underflow != GUARD_UNDERFLOW, 0)) {
         fprintf(stderr,
-            "\n*** CANARY_SANITIZER: HEAP UNDERFLOW in %s() ptr=%p "
+            "\n*** LITESAN: HEAP UNDERFLOW in %s() ptr=%p "
             "expected=0x%llx got=0x%llx ***\n",
             fn, user, (unsigned long long)UNDERFLOW_CANARY,
             (unsigned long long)hdr->underflow);
@@ -203,7 +203,7 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
     }
     if (__builtin_expect(hdr->canary != HEAD_CANARY, 0)) {
         fprintf(stderr,
-            "\n*** CANARY_SANITIZER: HEAD CANARY corrupt in %s() ptr=%p "
+            "\n*** LITESAN: HEAD CANARY corrupt in %s() ptr=%p "
             "expected=0x%llx got=0x%llx ***\n",
             fn, user, (unsigned long long)HEAD_CANARY,
             (unsigned long long)hdr->canary);
@@ -213,7 +213,7 @@ static void check_canaries(alloc_header_t *hdr, void *user, const char *fn) {
     uint64_t tail = *(uint64_t *)((char *)user + hdr->size);
     if (__builtin_expect(tail != TAIL_CANARY, 0)) {
         fprintf(stderr,
-            "\n*** CANARY_SANITIZER: HEAP BUFFER OVERFLOW in %s() ptr=%p "
+            "\n*** LITESAN: HEAP BUFFER OVERFLOW in %s() ptr=%p "
             "size=%zu expected=0x%llx got=0x%llx ***\n",
             fn, user, hdr->size, (unsigned long long)TAIL_CANARY,
             (unsigned long long)tail);
@@ -241,7 +241,7 @@ static void check_quarantined(alloc_header_t *hdr) {
 
     if (__builtin_expect(hdr->canary != FREED_CANARY, 0)) {
         fprintf(stderr,
-            "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
+            "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
             "    ptr=%p size=%zu (header corrupted after free, "
             "expected=0x%llx got=0x%llx)\n",
             user, saved_size,
@@ -255,7 +255,7 @@ static void check_quarantined(alloc_header_t *hdr) {
         uint64_t first8 = *(uint64_t *)user;
         if (__builtin_expect(first8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
             fprintf(stderr,
-                "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
+                "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
                 "    ptr=%p size=%zu (freed data corrupted at offset 0, "
                 "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
                 user, saved_size, (unsigned long long)first8);
@@ -274,7 +274,7 @@ static void check_quarantined(alloc_header_t *hdr) {
         uint64_t mid8 = *(uint64_t *)((char *)user + mid_off);
         if (__builtin_expect(mid8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
             fprintf(stderr,
-                "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
+                "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
                 "    ptr=%p size=%zu (freed data corrupted at offset %zu, "
                 "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
                 user, saved_size, mid_off, (unsigned long long)mid8);
@@ -292,7 +292,7 @@ static void check_quarantined(alloc_header_t *hdr) {
         uint64_t end8 = *(uint64_t *)((char *)user + end_off);
         if (__builtin_expect(end8 != 0xFEFEFEFEFEFEFEFEULL, 0)) {
             fprintf(stderr,
-                "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
+                "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
                 "    ptr=%p size=%zu (freed data corrupted at offset %zu, "
                 "expected=0xFEFEFEFEFEFEFEFE got=0x%llx)\n",
                 user, saved_size, end_off, (unsigned long long)end8);
@@ -311,7 +311,7 @@ static void check_quarantined(alloc_header_t *hdr) {
         for (size_t i = 0; i < saved_size; i++) {
             if (__builtin_expect(p[i] != POISON_BYTE, 0)) {
                 fprintf(stderr,
-                    "\n*** CANARY_SANITIZER: USE-AFTER-FREE WRITE detected ***\n"
+                    "\n*** LITESAN: USE-AFTER-FREE WRITE detected ***\n"
                     "    ptr=%p size=%zu (freed data corrupted at byte %zu, "
                     "expected=0x%02x got=0x%02x) [full-buffer scan]\n",
                     user, saved_size, i, POISON_BYTE, p[i]);
@@ -384,13 +384,13 @@ static void scan_registry_range(size_t start, size_t count, int is_signal) {
         if (__builtin_expect(hdr->underflow != UNDERFLOW_CANARY &&
                              hdr->underflow != GUARD_UNDERFLOW, 0)) {
             if (is_signal) {
-                safe_write("\n*** CANARY_SANITIZER: HEAP UNDERFLOW "
+                safe_write("\n*** LITESAN: HEAP UNDERFLOW "
                            "(registry scan) ptr=");
                 safe_write_hex((uint64_t)(uintptr_t)user);
                 safe_write(" ***\n");
             } else {
                 fprintf(stderr,
-                    "\n*** CANARY_SANITIZER: HEAP UNDERFLOW "
+                    "\n*** LITESAN: HEAP UNDERFLOW "
                     "(registry scan) ptr=%p expected=0x%llx got=0x%llx ***\n",
                     user, (unsigned long long)UNDERFLOW_CANARY,
                     (unsigned long long)hdr->underflow);
@@ -403,13 +403,13 @@ static void scan_registry_range(size_t start, size_t count, int is_signal) {
         /* Check head canary */
         if (__builtin_expect(hdr->canary != HEAD_CANARY, 0)) {
             if (is_signal) {
-                safe_write("\n*** CANARY_SANITIZER: HEAD CANARY corrupt "
+                safe_write("\n*** LITESAN: HEAD CANARY corrupt "
                            "(registry scan) ptr=");
                 safe_write_hex((uint64_t)(uintptr_t)user);
                 safe_write(" ***\n");
             } else {
                 fprintf(stderr,
-                    "\n*** CANARY_SANITIZER: HEAD CANARY corrupt "
+                    "\n*** LITESAN: HEAD CANARY corrupt "
                     "(registry scan) ptr=%p expected=0x%llx got=0x%llx ***\n",
                     user, (unsigned long long)HEAD_CANARY,
                     (unsigned long long)hdr->canary);
@@ -423,13 +423,13 @@ static void scan_registry_range(size_t start, size_t count, int is_signal) {
         uint64_t tail = *(uint64_t *)((char *)user + hdr->size);
         if (__builtin_expect(tail != TAIL_CANARY, 0)) {
             if (is_signal) {
-                safe_write("\n*** CANARY_SANITIZER: HEAP BUFFER OVERFLOW "
+                safe_write("\n*** LITESAN: HEAP BUFFER OVERFLOW "
                            "(registry scan) ptr=");
                 safe_write_hex((uint64_t)(uintptr_t)user);
                 safe_write(" ***\n");
             } else {
                 fprintf(stderr,
-                    "\n*** CANARY_SANITIZER: HEAP BUFFER OVERFLOW "
+                    "\n*** LITESAN: HEAP BUFFER OVERFLOW "
                     "(registry scan) ptr=%p size=%zu "
                     "expected=0x%llx got=0x%llx ***\n",
                     user, hdr->size, (unsigned long long)TAIL_CANARY,
@@ -555,7 +555,7 @@ static void crash_signal_handler(int sig, siginfo_t *info, void *ucontext) {
 }
 
 __attribute__((constructor))
-static void canary_sanitizer_init(void) {
+static void litesan_init(void) {
     resolve_real();
     atexit(atexit_scan);
 

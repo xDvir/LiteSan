@@ -1,11 +1,11 @@
 /*
- * bench_speed.c — Benchmark for canary_sanitizer throughput.
+ * bench_speed.c — Benchmark for litesan throughput.
  *
  * Measures malloc/free/calloc/realloc throughput.
  * Run three ways:
  *   1) No sanitizer (baseline):     ./bench_speed
- *   2) v1 sanitizer:                LD_PRELOAD=../canary_sanitizer.so ./bench_speed
- *   3) v2 sanitizer:                LD_PRELOAD=./canary_sanitizer.so ./bench_speed
+ *   2) v1 sanitizer:                LD_PRELOAD=../litesan.so ./bench_speed
+ *   3) v2 sanitizer:                LD_PRELOAD=./litesan.so ./bench_speed
  *
  * Use the run_bench.sh script to automate all three and compare.
  */
@@ -158,7 +158,7 @@ static void bench_realloc_chain(void) {
 }
 
 int main(void) {
-    printf("=== Canary Sanitizer Benchmark (%d iterations) ===\n\n", ITERS);
+    printf("=== LiteSan Benchmark (%d iterations) ===\n\n", ITERS);
 
     bench_malloc_free();
     bench_pure_malloc_free();
