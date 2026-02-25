@@ -950,6 +950,24 @@ dramatically lower overhead than libdislocator.
    underflow that writes to a different allocation before ours (not into our
    red zone) won't be caught by the underflow check.
 
+### QEMU user-mode caveats
+
+9. **No UAF detection under QEMU aarch64**: The quarantine must be disabled
+   (`-DLITESAN_NO_QUARANTINE`) because the guest dynamic linker reuses freed
+   memory internally. Poisoning it corrupts linker state and causes false
+   "stack smashing detected" crashes on ~46% of inputs.
+
+10. **Aligned allocations > 16 bytes bypass LiteSan**: `posix_memalign`,
+    `memalign`, and `aligned_alloc` with alignment > 16 pass through to the
+    real allocator (no canary protection). This is required because LiteSan's
+    32-byte header breaks alignment guarantees for SIMD/DMA buffers. Overflow
+    detection still works for alignment <= 16.
+
+11. **`malloc_usable_size` returns 0 for non-LiteSan pointers**: Libraries
+    using Small Buffer Optimization (e.g., Skia's `SkAutoSTMalloc`) call
+    `malloc_usable_size` on stack pointers. LiteSan validates the head canary
+    and returns 0 for non-heap pointers, matching glibc behavior.
+
 ### Thread safety caveats
 
 The quarantine is lock-free and safe. However, the `check_canaries()` function
@@ -981,20 +999,41 @@ tail IS a real bug), but the backtrace might not show the exact corrupting threa
 
 ## Build and Usage
 
-### Build
+### Build (native x86-64 — full features)
 
 ```bash
-cd /home/dvirgo/custom_sanitizer
 gcc -shared -fPIC -O3 -o litesan.so litesan.c -ldl -rdynamic
 ```
 
-Flags:
+All detections enabled: heap OOB, underflow, double-free, UAF (quarantine +
+poisoning), guard pages, registry scanning.
+
+### Build (aarch64 cross-compile — for QEMU user-mode fuzzing)
+
+```bash
+aarch64-linux-gnu-gcc -DLITESAN_NO_QUARANTINE -shared -fPIC -O3 \
+  -o litesan_aarch64.so litesan.c -ldl -rdynamic
+```
+
+The `-DLITESAN_NO_QUARANTINE` flag disables quarantine and memory poisoning.
+This is required for QEMU user-mode because the aarch64 dynamic linker
+internally reuses freed memory, and poisoning it corrupts linker state
+(manifests as "stack smashing detected" on ~46% of inputs).
+
+**What you keep:** heap OOB (tail canary), underflow, double-free, guard pages,
+registry scanning, junk fill.
+
+**What you lose:** UAF detection (no poisoning, no quarantine eviction checks).
+
+### Flags
+
 - `-shared -fPIC`: build as position-independent shared library
 - `-O3`: aggressive optimization (auto-vectorization, inlining — important for
   fuzzing throughput)
 - `-ldl`: link libdl for `dlsym()` (resolving real libc functions)
 - `-rdynamic`: export symbols from the executable so `backtrace_symbols_fd()`
   can resolve function names in the backtrace output
+- `-DLITESAN_NO_QUARANTINE`: disable quarantine/poisoning (for QEMU aarch64)
 
 ### Run tests
 
@@ -1003,45 +1042,46 @@ bash tests/run_tests.sh          # 48 tests
 bash tests/run_bench.sh          # Benchmark: baseline vs sanitizer
 ```
 
-### Standalone test (single PDF)
+### With AFL++ QEMU persistent mode (aarch64 target)
+
+Pass the aarch64 build to the QEMU guest via `QEMU_SET_ENV`:
+
 ```bash
-LD_PRELOAD=./foxit_throw_bypass.so:./custom_sanitizer/litesan.so \
-  ./harness_foxit_persist test.pdf
+export QEMU_SET_ENV="LD_LIBRARY_PATH=/path/to/libs,LD_PRELOAD=/path/to/litesan_aarch64.so"
+export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+afl-fuzz -Q -i corpus -o out -- /path/to/harness
 ```
 
-### With AFL++ (single instance test)
+**Important:** Also set `AFL_INST_LIBS=1` so AFL++ instruments the target
+shared libraries, not just the harness binary.
+
+### Standalone test (single file)
 ```bash
-./scripts/run_fuzz_canary_test.sh              # Fresh start
-./scripts/run_fuzz_canary_test.sh --resume     # Resume
-```
+# Native x86
+LD_PRELOAD=./litesan.so ./harness test_input
 
-### With AFL++ (10 parallel instances)
-```bash
-./scripts/run_fuzz_10_canary.sh                # Fresh start
-./scripts/run_fuzz_10_canary.sh --resume       # Resume
+# aarch64 via QEMU
+QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
+qemu-aarch64 -L /usr/aarch64-linux-gnu \
+  -E LD_PRELOAD=/path/to/litesan_aarch64.so \
+  -E LD_LIBRARY_PATH=/path/to/libs \
+  ./harness test_input
 ```
-
-### AFL_PRELOAD order
-```
-AFL_PRELOAD=foxit_throw_bypass.so:litesan.so
-```
-
-The bypass .so MUST come first — it installs signal handlers that the canary
-sanitizer's `abort()` calls flow through.
 
 ### No harness changes needed
 
-LiteSan is a pure LD_PRELOAD shim. It works with the existing
-`harness_foxit_persist` binary without any modifications.
+LiteSan is a pure LD_PRELOAD shim. It works with any existing binary
+without modifications.
 
 ---
 
 ## Files
 
 ```
-custom_sanitizer/
-├── litesan.c                 — Source (~800 lines)
-├── litesan.so                — Compiled library (-O3)
+LiteSan/
+├── litesan.c                 — Source (~820 lines, builds for both x86 and aarch64)
+├── litesan.so                — Compiled library, native x86 (-O3)
+├── litesan_aarch64.so        — Compiled library, aarch64 (-O3 -DLITESAN_NO_QUARANTINE)
 ├── README.md                 — This file
 ├── .gitignore
 └── tests/                    — Test suite (48 tests)
